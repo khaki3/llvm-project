@@ -4869,19 +4869,16 @@ genACC(Fortran::lower::AbstractConverter &converter,
         [&](auto &&s) { return ea.Analyze(s); }, accObject.u);
 
     llvm::SmallVector<mlir::Value> bounds;
-    Fortran::lower::gatherDataOperandAddrAndBounds<mlir::acc::DataBoundsOp,
-                                                   mlir::acc::DataBoundsType>(
-        converter, builder, semanticsContext, stmtCtx, symbol, designator,
-        operandLocation, asFortran, bounds,
-        /*treatIndexAsSection=*/true, /*unwrapFirBox=*/false,
-        /*genDefaultBounds=*/false, /*strideIncludeLowerExtent=*/false,
-        /*loadAllocatableAndPointerComponent=*/false);
+    fir::factory::AddrAndBoundsInfo info =
+        Fortran::lower::gatherDataOperandAddrAndBounds<
+            mlir::acc::DataBoundsOp, mlir::acc::DataBoundsType>(
+            converter, builder, semanticsContext, stmtCtx, symbol, designator,
+            operandLocation, asFortran, bounds,
+            /*treatIndexAsSection=*/true, /*unwrapFirBox=*/false,
+            /*genDefaultBounds=*/false, /*strideIncludeLowerExtent=*/false,
+            /*loadAllocatableAndPointerComponent=*/false);
 
-    std::optional<fir::FortranVariableOpInterface> varDef =
-        converter.getSymbolMap().lookupVariableDefinition(symbol);
-    assert(varDef.has_value() && llvm::isa<hlfir::DeclareOp>(*varDef) &&
-           "expected symbol to be mapped to hlfir.declare");
-    mlir::Value base = varDef->getBase();
+    mlir::Value base = info.addr;
 
     mlir::acc::CacheOp cacheOp = createDataEntryOp<mlir::acc::CacheOp>(
         builder, operandLocation, base, asFortran, bounds,
@@ -4892,9 +4889,15 @@ genACC(Fortran::lower::AbstractConverter &converter,
         isReadonly ? mlir::acc::DataClauseModifier::readonly
                    : mlir::acc::DataClauseModifier::none);
 
-    fir::ExtendedValue hostExv = converter.getSymbolExtendedValue(symbol);
-    fir::ExtendedValue cacheExv = fir::substBase(hostExv, cacheOp.getAccVar());
-    converter.bindSymbol(symbol, cacheExv);
+    // Only rebind the symbol when caching the whole variable (no bounds).
+    // For array sections or component references, the symbol binding doesn't
+    // apply since we're caching a subset, not the whole symbol.
+    if (bounds.empty()) {
+      fir::ExtendedValue hostExv = converter.getSymbolExtendedValue(symbol);
+      fir::ExtendedValue cacheExv =
+          fir::substBase(hostExv, cacheOp.getAccVar());
+      converter.bindSymbol(symbol, cacheExv);
+    }
   }
 }
 
