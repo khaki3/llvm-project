@@ -4856,12 +4856,11 @@ genACC(Fortran::lower::AbstractConverter &converter,
       modifier &&
       (*modifier).v == Fortran::parser::AccDataModifier::Modifier::ReadOnly;
 
-  Fortran::lower::StatementContext stmtCtx;
+  Fortran::lower::StatementContext &stmtCtx = converter.getFctCtx();
 
   for (const auto &accObject : accObjectList.v) {
     mlir::Location operandLocation = genOperandLocation(converter, accObject);
     Fortran::semantics::Symbol &symbol = getSymbolFromAccObject(accObject);
-
     std::stringstream asFortran;
 
     Fortran::evaluate::ExpressionAnalyzer ea{semanticsContext};
@@ -4878,7 +4877,13 @@ genACC(Fortran::lower::AbstractConverter &converter,
             /*genDefaultBounds=*/false, /*strideIncludeLowerExtent=*/false,
             /*loadAllocatableAndPointerComponent=*/false);
 
-    mlir::Value base = info.addr;
+    mlir::Value base = info.addr ? info.addr : info.rawInput;
+    if (!base && designator)
+      base = fir::getBase(
+          converter.genExprAddr(operandLocation, *designator, stmtCtx));
+
+    if (!base)
+      continue;
 
     mlir::acc::CacheOp cacheOp = createDataEntryOp<mlir::acc::CacheOp>(
         builder, operandLocation, base, asFortran, bounds,
@@ -4889,14 +4894,55 @@ genACC(Fortran::lower::AbstractConverter &converter,
         isReadonly ? mlir::acc::DataClauseModifier::readonly
                    : mlir::acc::DataClauseModifier::none);
 
-    // Only rebind the symbol when caching the whole variable (no bounds).
-    // For array sections or component references, the symbol binding doesn't
-    // apply since we're caching a subset, not the whole symbol.
-    if (bounds.empty()) {
+    // Rebind the symbol so subsequent references use the cached value.
+    if (Fortran::lower::SymbolBox symBox =
+            converter.getSymbolMap().lookupSymbol(symbol)) {
+      // For simple variables, rebind the symbol directly.
       fir::ExtendedValue hostExv = converter.getSymbolExtendedValue(symbol);
       fir::ExtendedValue cacheExv =
           fir::substBase(hostExv, cacheOp.getAccVar());
       converter.bindSymbol(symbol, cacheExv);
+    } else if (designator) {
+      // For derived type components, extract the component reference and
+      // add a component override so subsequent accesses use the cached value.
+      std::optional<Fortran::evaluate::Component> componentRef;
+      if (std::optional<Fortran::evaluate::DataRef> dataRef =
+              Fortran::evaluate::ExtractDataRef(*designator)) {
+        Fortran::common::visit(
+            Fortran::common::visitors{
+                [&](const Fortran::evaluate::Component &component) {
+                  componentRef = component;
+                },
+                [&](const Fortran::evaluate::ArrayRef &arrayRef) {
+                  if (auto *comp = arrayRef.base().UnwrapComponent())
+                    componentRef = *comp;
+                },
+                [&](const auto &) {}},
+            dataRef->u);
+      }
+
+      if (componentRef) {
+        // Create an hlfir.declare for the cache result and add component
+        // override so subsequent accesses use the cached value.
+        llvm::SmallVector<mlir::Value> lenParams;
+        mlir::Value shape;
+        if (auto arrTy = mlir::dyn_cast<fir::SequenceType>(
+                fir::unwrapRefType(base.getType()))) {
+          llvm::SmallVector<mlir::Value> extents;
+          for (int64_t ext : arrTy.getShape()) {
+            if (ext != fir::SequenceType::getUnknownExtent())
+              extents.push_back(builder.createIntegerConstant(
+                  operandLocation, builder.getIndexType(), ext));
+          }
+          if (!extents.empty())
+            shape = builder.genShape(operandLocation, extents);
+        }
+        auto declareOp = hlfir::DeclareOp::create(
+            builder, operandLocation, cacheOp.getAccVar(), asFortran.str(),
+            shape, lenParams, /*dummyScope=*/nullptr, /*storage=*/nullptr,
+            /*storageOffset=*/0, fir::FortranVariableFlagsAttr{});
+        converter.getSymbolMap().addComponentOverride(*componentRef, declareOp);
+      }
     }
   }
 }

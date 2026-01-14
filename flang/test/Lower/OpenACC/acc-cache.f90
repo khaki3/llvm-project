@@ -581,7 +581,7 @@ subroutine test_cache_derived_type()
 ! CHECK: acc.loop
 ! CHECK: %[[ARRAY_COORD:.*]] = hlfir.designate %{{.*}}{"array"} shape %{{.*}} : (!fir.ref<!fir.type<_QFtest_cache_derived_typeTdt{array:!fir.array<100xf32>}>>, !fir.shape<1>) -> !fir.ref<!fir.array<100xf32>>
 ! CHECK: %[[BOUND:.*]] = acc.bounds lowerbound(%{{.*}} : index) upperbound(%{{.*}} : index) extent(%{{.*}} : index) stride(%{{.*}} : index) startIdx(%{{.*}} : index)
-! CHECK: %[[CACHE:.*]] = acc.cache varPtr(%[[ARRAY_COORD]] : !fir.ref<!fir.array<100xf32>>) bounds(%[[BOUND]]) -> !fir.ref<!fir.array<100xf32>> {name = "data%array(i-4:i+4)"}
+! CHECK: %[[CACHE:.*]] = acc.cache varPtr(%[[ARRAY_COORD]] : !fir.ref<!fir.array<100xf32>>) bounds(%[[BOUND]]) -> !fir.ref<!fir.array<100xf32>> {name = "data%array(i-4_4:i+4_4)", structured = false}
 ! CHECK: acc.yield
 end subroutine
 
@@ -605,7 +605,7 @@ subroutine test_cache_derived_type_readonly()
 ! CHECK: acc.loop
 ! CHECK: %[[ARRAY_COORD:.*]] = hlfir.designate %{{.*}}{"array"} shape %{{.*}} : (!fir.ref<!fir.type<_QFtest_cache_derived_type_readonlyTdt{array:!fir.array<100xf32>}>>, !fir.shape<1>) -> !fir.ref<!fir.array<100xf32>>
 ! CHECK: %[[BOUND:.*]] = acc.bounds lowerbound(%{{.*}} : index) upperbound(%{{.*}} : index) extent(%{{.*}} : index) stride(%{{.*}} : index) startIdx(%{{.*}} : index)
-! CHECK: %[[CACHE:.*]] = acc.cache varPtr(%[[ARRAY_COORD]] : !fir.ref<!fir.array<100xf32>>) bounds(%[[BOUND]]) -> !fir.ref<!fir.array<100xf32>> {modifiers = #acc<data_clause_modifier readonly>, name = "data%array(i-4:i+4)"}
+! CHECK: %[[CACHE:.*]] = acc.cache varPtr(%[[ARRAY_COORD]] : !fir.ref<!fir.array<100xf32>>) bounds(%[[BOUND]]) -> !fir.ref<!fir.array<100xf32>> {modifiers = #acc<data_clause_modifier readonly>, name = "data%array(i-4_4:i+4_4)", structured = false}
 ! CHECK: acc.yield
 end subroutine
 
@@ -634,6 +634,6 @@ subroutine test_cache_nested_derived_type()
 ! CHECK: %[[IN_COORD:.*]] = hlfir.designate %{{.*}}{"in"} : (!fir.ref<!fir.type<_QFtest_cache_nested_derived_typeTouter{in:!fir.type<_QFtest_cache_nested_derived_typeTinner{arr:!fir.array<50xf32>}>}>>) -> !fir.ref<!fir.type<_QFtest_cache_nested_derived_typeTinner{arr:!fir.array<50xf32>}>>
 ! CHECK: %[[ARR_COORD:.*]] = hlfir.designate %[[IN_COORD]]{"arr"} shape %{{.*}} : (!fir.ref<!fir.type<_QFtest_cache_nested_derived_typeTinner{arr:!fir.array<50xf32>}>>, !fir.shape<1>) -> !fir.ref<!fir.array<50xf32>>
 ! CHECK: %[[BOUND:.*]] = acc.bounds lowerbound(%{{.*}} : index) upperbound(%{{.*}} : index) extent(%{{.*}} : index) stride(%{{.*}} : index) startIdx(%{{.*}} : index)
-! CHECK: %[[CACHE:.*]] = acc.cache varPtr(%[[ARR_COORD]] : !fir.ref<!fir.array<50xf32>>) bounds(%[[BOUND]]) -> !fir.ref<!fir.array<50xf32>> {name = "obj%in%arr(i)"}
+! CHECK: %[[CACHE:.*]] = acc.cache varPtr(%[[ARR_COORD]] : !fir.ref<!fir.array<50xf32>>) bounds(%[[BOUND]]) -> !fir.ref<!fir.array<50xf32>> {name = "obj%in%arr(i)", structured = false}
 ! CHECK: acc.yield
 end subroutine
