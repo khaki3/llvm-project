@@ -94,6 +94,15 @@ func.func @reduction_accumulate_array_empty_par_dims(%private: memref<4xi32>, %b
 
 // -----
 
+func.func @reduction_accumulate_array_compact_not_private(%private: memref<4xi32>, %bounds: !acc.data_bounds_ty) {
+  // expected-error@+1 {{compact accumulator must also be marked thread-private}}
+  acc.reduction_accumulate_array %private bounds(%bounds) <add>
+      : memref<4xi32> {accumulator_is_compact, par_dims = #acc<par_dims[thread_x]>}
+  return
+}
+
+// -----
+
 func.func @predicate_region_empty() {
   acc.compute_region {
     // expected-error@+1 {{region needs to have at least one block}}

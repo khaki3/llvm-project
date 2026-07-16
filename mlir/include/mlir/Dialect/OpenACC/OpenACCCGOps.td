@@ -180,13 +180,18 @@ def OpenACC_ReductionAccumulateArrayOp
   let description = [{
     Accumulates elements of an array across the specified parallel dimension 
     given an acc.bounds op.
+
+    `accumulator_is_thread_private` identifies one accumulator copy per thread.
+    `accumulator_is_compact` indicates bounds index a zero-based compact copy.
   }];
   let arguments = (ins Arg<OpenACC_PointerLikeTypeInterface,
                            "Reduction variable to update",
                            [MemRead, MemWrite]>:$memref,
                        OpenACC_DataBoundsType:$bounds,
                        OpenACC_ReductionOperatorAttr:$reductionOperator,
-                       OpenACC_GPUParallelDimsAttr:$par_dims);
+                       OpenACC_GPUParallelDimsAttr:$par_dims,
+                       UnitAttr:$accumulator_is_thread_private,
+                       UnitAttr:$accumulator_is_compact);
   let assemblyFormat = [{
     $memref `bounds` `(` $bounds `)` $reductionOperator `:` type($memref) attr-dict
   }];

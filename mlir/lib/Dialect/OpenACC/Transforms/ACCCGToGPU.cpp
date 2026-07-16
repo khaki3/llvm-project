@@ -346,6 +346,21 @@ static Value unwrapMemRefConversion(Value v) {
   return v;
 }
 
+/// True when a mapped memref is backed by shared or heap storage.
+static bool hasSharedMappedBacking(Value v) {
+  while (Operation *op = v.getDefiningOp()) {
+    if (isa<memref::AllocOp, acc::UnwrapPrivateOp>(op))
+      return true;
+    if (isa<memref::AllocaOp>(op))
+      return false;
+    auto viewLike = dyn_cast<ViewLikeOpInterface>(op);
+    if (!viewLike)
+      break;
+    v = viewLike.getViewSource();
+  }
+  return false;
+}
+
 /// Casts between pointer-like private types when lowering requires it.
 static Value castPointerLikeTypeIfNeeded(OpBuilder &builder, Location loc,
                                          Value value, Type resultType) {
@@ -743,6 +758,8 @@ static void initPerThreadArrayAccum(OpBuilder &b, Location loc, Value alloca,
   b.setInsertionPoint(forOp.getBody()->getTerminator());
   memref::StoreOp::create(b, loc, ident, alloca, forOp.getInductionVar());
 }
+
+static acc::PrivateLocalOp getPrivateLocalForMemref(Value memref);
 
 std::optional<int64_t>
 ACCCGToGPULowering::isEligibleForSharedMemory(acc::PrivateLocalOp privateLocal,
@@ -1251,7 +1268,7 @@ ACCCGToGPULowering::computeActiveAndInactiveParDims(Operation *op,
       // as active dims so predication is correct for per-worker/gang memory.
       if (memref::StoreOp storeOp = dyn_cast<memref::StoreOp>(op)) {
         if (auto privateLocalOp =
-                storeOp.getMemref().getDefiningOp<acc::PrivateLocalOp>()) {
+                getPrivateLocalForMemref(storeOp.getMemref())) {
           acc::PrivatizeOp privatizeOp =
               getPrivatizeOp(privateLocalOp, computeRegion);
           if (mlir::acc::GPUParallelDimsAttr parDimsAttr =
@@ -3246,16 +3263,27 @@ void ACCCGToGPULowering::processAccumulateArrayOp(
     return;
   }
 
-  // Per-element gpu.all_reduce is only correct for a per-thread alloca; mirror
-  // processPrivateLocal's stack-fit decision rather than inspect the memref.
-  bool isPerThreadPrivate =
-      canUseStackAlloca(memrefTy, loc, options.maxThreadPrivateStack);
+  // Cross-thread reduction requires one accumulator copy per thread.
+  Value mappedBase = unwrapMemRefConversion(memref);
+  Value originalBase = unwrapMemRefConversion(op.getMemref());
+  Operation *mappedDef = mappedBase.getDefiningOp();
+  bool isPerThreadPrivate = isa_and_nonnull<memref::AllocaOp>(mappedDef);
+  bool hasSharedBacking = hasSharedMappedBacking(memref);
+  if (!hasSharedBacking) {
+    isPerThreadPrivate |= op.getAccumulatorIsThreadPrivate();
+    if (auto privateLocal = originalBase.getDefiningOp<acc::PrivateLocalOp>()) {
+      isPerThreadPrivate |=
+          getPrivateMemScope(getPrivatizeOp(privateLocal, computeRegion)) ==
+          PrivateMemScope::Thread;
+    } else if (auto privatize =
+                   originalBase.getDefiningOp<acc::PrivatizeOp>()) {
+      isPerThreadPrivate |=
+          getPrivateMemScope(privatize) == PrivateMemScope::Thread;
+    }
+  }
   if (!isPerThreadPrivate) {
-    // Block-shared accumulator: no-op only when the accumulate spans a block
-    // dim (threads distribute distinct elements, so the block partial is in
-    // place and the atomic combine finishes it). A thread-only shared
-    // reduction, where several threads reduce into the same element, is not yet
-    // supported.
+    // A block-spanning shared accumulator already contains the block partial.
+    // Thread-only shared accumulation is not yet supported.
     if (hasBlockDim) {
       eraseDeadBounds();
     } else {
@@ -3265,7 +3293,17 @@ void ACCCGToGPULowering::processAccumulateArrayOp(
     return;
   }
 
-  // Bounds are normalized to be zero-based.
+  std::optional<int64_t> compactAllocaExtent;
+  if (op.getAccumulatorIsCompact() &&
+      isa_and_nonnull<memref::AllocaOp>(mappedBase.getDefiningOp())) {
+    if (auto baseTy = dyn_cast<MemRefType>(mappedBase.getType());
+        baseTy && baseTy.getRank() == 1 && baseTy.hasStaticShape()) {
+      memref = mappedBase;
+      memrefTy = baseTy;
+      compactAllocaExtent = baseTy.getDimSize(0);
+    }
+  }
+
   auto toIndex = [&](Value v) -> Value {
     if (v.getType().isIndex())
       return v;
@@ -3273,19 +3311,43 @@ void ACCCGToGPULowering::processAccumulateArrayOp(
                                       v);
   };
 
-  Value lb = boundsOp.getLowerbound()
-                 ? toIndex(boundsOp.getLowerbound())
-                 : arith::ConstantIndexOp::create(rewriter, loc, 0);
-  Value step = boundsOp.getStride()
-                   ? toIndex(boundsOp.getStride())
-                   : arith::ConstantIndexOp::create(rewriter, loc, 1);
+  Value zero = arith::ConstantIndexOp::create(rewriter, loc, 0);
   Value one = arith::ConstantIndexOp::create(rewriter, loc, 1);
+  Value originalLb =
+      boundsOp.getLowerbound() ? toIndex(boundsOp.getLowerbound()) : zero;
+  Value elementStep =
+      boundsOp.getStride() ? toIndex(boundsOp.getStride()) : one;
+  if (boundsOp.getStrideInBytes()) {
+    Value elementSize = arith::ConstantIndexOp::create(
+        rewriter, loc, getElementSizeInBytes(loc, memrefTy.getElementType()));
+    elementStep =
+        arith::DivSIOp::create(rewriter, loc, elementStep, elementSize);
+  }
+
+  bool normalizeBounds = op.getAccumulatorIsCompact();
+  Value lb = normalizeBounds ? zero : originalLb;
+  Value step = normalizeBounds ? one : elementStep;
   // Exclusive upper bound: prefer extent (count of elements), fall back to the
   // inclusive upperbound.
   Value ub;
-  if (boundsOp.getExtent()) {
-    ub =
-        arith::AddIOp::create(rewriter, loc, lb, toIndex(boundsOp.getExtent()));
+  if (normalizeBounds) {
+    if (compactAllocaExtent) {
+      ub = arith::ConstantIndexOp::create(rewriter, loc, *compactAllocaExtent);
+    } else if (boundsOp.getExtent()) {
+      ub = toIndex(boundsOp.getExtent());
+    } else {
+      assert(boundsOp.getUpperbound() &&
+             "acc.bounds must specify an extent or upperbound");
+      Value span = arith::SubIOp::create(
+          rewriter, loc, toIndex(boundsOp.getUpperbound()), originalLb);
+      ub = arith::AddIOp::create(
+          rewriter, loc,
+          arith::DivSIOp::create(rewriter, loc, span, elementStep), one);
+    }
+  } else if (boundsOp.getExtent()) {
+    Value span = arith::MulIOp::create(
+        rewriter, loc, toIndex(boundsOp.getExtent()), elementStep);
+    ub = arith::AddIOp::create(rewriter, loc, lb, span);
   } else {
     assert(boundsOp.getUpperbound() &&
            "acc.bounds must specify an extent or upperbound");

@@ -493,6 +493,9 @@ LogicalResult ReductionAccumulateOp::verify() {
 LogicalResult ReductionAccumulateArrayOp::verify() {
   if (getParDims().getArray().empty())
     return emitOpError("par_dims must specify at least one parallel dimension");
+  if (getAccumulatorIsCompact() && !getAccumulatorIsThreadPrivate())
+    return emitOpError(
+        "compact accumulator must also be marked thread-private");
   return success();
 }
 
