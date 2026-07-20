@@ -1246,7 +1246,30 @@ ACCCGToGPULowering::computeActiveAndInactiveParDims(Operation *op,
   mlir::acc::GPUParallelDimAttr lowestParDim =
       mlir::acc::GPUParallelDimAttr::threadXDim(ctx);
   if (block) {
-    block->walk([&](Operation *op) {
+    std::optional<bool> combineThreadYActive;
+    auto applyCombineParDims =
+        [&](Operation *combineOp, Value src,
+            ArrayRef<mlir::acc::GPUParallelDimAttr> combineParDims) {
+          bool isWorkerPrivate =
+              getPrivateScopeForMemref(src) == PrivateMemScope::Worker;
+          for (mlir::acc::GPUParallelDimAttr parDim : combineParDims) {
+            if (parDim.isThreadY()) {
+              if (combineThreadYActive &&
+                  *combineThreadYActive != isWorkerPrivate) {
+                combineOp->emitError()
+                    << "mixed worker-private and non-worker-private reduction "
+                       "combines require incompatible ThreadY predication";
+                hasFailed = true;
+                return failure();
+              }
+              combineThreadYActive = isWorkerPrivate;
+            } else {
+              mlir::acc::removeParDim(ancestorParDims, parDim);
+            }
+          }
+          return success();
+        };
+    block->walk([&](Operation *op) -> WalkResult {
       // Check stores to acc.private_local - add the privatize's par_dims
       // as active dims so predication is correct for per-worker/gang memory.
       if (memref::StoreOp storeOp = dyn_cast<memref::StoreOp>(op)) {
@@ -1277,17 +1300,17 @@ ACCCGToGPULowering::computeActiveAndInactiveParDims(Operation *op,
       // kernel and loop in combined constructs.
       if (acc::ReductionCombineOp reductionCombineOp =
               dyn_cast<acc::ReductionCombineOp>(op)) {
-        for (mlir::acc::GPUParallelDimAttr parDim :
-             getReductionCombineParDims(reductionCombineOp)) {
-          mlir::acc::removeParDim(ancestorParDims, parDim);
-        }
+        if (failed(applyCombineParDims(
+                reductionCombineOp, reductionCombineOp.getSrcMemref(),
+                getReductionCombineParDims(reductionCombineOp))))
+          return WalkResult::interrupt();
       }
       if (acc::ReductionCombineRegionOp combineRegionOp =
               dyn_cast<acc::ReductionCombineRegionOp>(op)) {
-        for (mlir::acc::GPUParallelDimAttr parDim :
-             getReductionCombineParDims(combineRegionOp)) {
-          mlir::acc::removeParDim(ancestorParDims, parDim);
-        }
+        if (failed(applyCombineParDims(
+                combineRegionOp, combineRegionOp.getSrcVar(),
+                getReductionCombineParDims(combineRegionOp))))
+          return WalkResult::interrupt();
       }
       // An array accumulate reduces across its par_dims via gpu.all_reduce, so
       // all those threads must execute it - treat them as active (unlike the
@@ -1301,6 +1324,14 @@ ACCCGToGPULowering::computeActiveAndInactiveParDims(Operation *op,
       }
       return WalkResult::advance();
     });
+    if (combineThreadYActive) {
+      mlir::acc::GPUParallelDimAttr threadY =
+          mlir::acc::GPUParallelDimAttr::threadYDim(ctx);
+      if (*combineThreadYActive)
+        mlir::acc::insertParDim(ancestorParDims, threadY);
+      else
+        mlir::acc::removeParDim(ancestorParDims, threadY);
+    }
   }
 
   // Obtain launch dimensions
@@ -1747,7 +1778,7 @@ ACCCGToGPULowering::getPrivateMemScope(acc::PrivatizeOp privatizeOp) {
   }
   if (hasThreadX)
     return PrivateMemScope::Thread;
-  if (hasBlock && hasThreadY)
+  if (hasThreadY)
     return PrivateMemScope::Worker;
   if (hasBlock)
     return PrivateMemScope::Gang;
@@ -1871,6 +1902,8 @@ void ACCCGToGPULowering::processPredicateRegion(
             SmallVector<mlir::acc::GPUParallelDimAttr>>
       parDimsPair = computeActiveAndInactiveParDims(
           interOp, &interOp.getRegion().front());
+  if (hasFailed)
+    return;
 
   // If ThreadY reduction exists, subgroup alignment is applied
   // (blockDim.x = subgroupSize), so ThreadX lanes exist even without explicit
