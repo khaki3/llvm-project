@@ -134,3 +134,37 @@ func.func @array_reduction_dynamic_par_dims(%buf: memref<?xi32>, %n: index) {
   } {origin = "acc.parallel"}
   return
 }
+
+// Dynamic per-thread accumulators use one stack allocation per executing
+// thread. Materializing a grid-wide backing buffer would scale with the total
+// logical block count and can exhaust device memory.
+//
+// CHECK-LABEL: func.func @array_reduction_dynamic_private
+// CHECK: gpu.launch
+// CHECK-NOT: acc.unwrap_private
+// CHECK: %[[ALLOCA:.*]] = memref.alloca(%{{.*}}) : memref<?xi32>
+// CHECK: scf.for
+// CHECK: memref.store {{.*}}, %[[ALLOCA]]
+// CHECK: gpu.all_reduce add
+func.func @array_reduction_dynamic_private(%n: index) {
+  %c1 = arith.constant 1 : index
+  %c128 = arith.constant 128 : index
+  %bx = acc.par_width %c1 {par_dim = #acc.par_dim<block_x>}
+  %tx = acc.par_width %c128 {par_dim = #acc.par_dim<thread_x>}
+  %private = acc.privatize(%n) [#acc<par_dims[block_x, thread_x]>]
+      : (index) -> !acc.private_type<memref<?xi32>>
+  acc.kernel_environment {
+    acc.compute_region launch(%kbx = %bx, %ktx = %tx)
+        ins(%arg = %private, %extent = %n)
+        : (!acc.private_type<memref<?xi32>>, index) {
+      %local = acc.private_local %arg
+          {acc.par_dims = #acc<par_dims[block_x, thread_x]>}
+          : (!acc.private_type<memref<?xi32>>) -> memref<?xi32>
+      %bounds = acc.bounds extent(%extent : index)
+      acc.reduction_accumulate_array %local bounds(%bounds) <add>
+          : memref<?xi32> {par_dims = #acc<par_dims[block_x, thread_x]>}
+      acc.yield
+    } {origin = "acc.parallel"}
+  }
+  return
+}
