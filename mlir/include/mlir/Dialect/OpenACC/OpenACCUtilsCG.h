@@ -21,12 +21,20 @@
 #include "mlir/Interfaces/DataLayoutInterfaces.h"
 #include "mlir/Support/LogicalResult.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringRef.h"
 #include <optional>
 
 namespace mlir {
 namespace acc {
 
 class OpenACCSupport;
+
+inline constexpr llvm::StringLiteral ArrayReductionModeAttrName =
+    "acc.array_reduction_mode";
+inline constexpr llvm::StringLiteral PrivateStorageKindAttrName =
+    "acc.private_storage_kind";
+inline constexpr llvm::StringLiteral ArrayReductionOperatorAttrName =
+    "acc.array_reduction_operator";
 
 /// Get the data layout for an operation.
 ///

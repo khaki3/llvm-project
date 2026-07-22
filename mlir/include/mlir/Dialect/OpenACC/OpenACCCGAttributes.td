@@ -102,4 +102,51 @@ def OpenACC_GPUBlockRedundantAttr
   }];
 }
 
+def OpenACC_ArrayReductionModePerThread
+    : I32EnumAttrCase<"PerThread", 0, "per_thread">;
+def OpenACC_ArrayReductionModeWorkerRow
+    : I32EnumAttrCase<"WorkerRow", 1, "worker_row">;
+def OpenACC_ArrayReductionModeBlockSharedNoOp
+    : I32EnumAttrCase<"BlockSharedNoOp", 2, "block_shared_noop">;
+
+def OpenACC_ArrayReductionMode : I32EnumAttr<
+    "ArrayReductionMode", "Array reduction storage policy",
+    [OpenACC_ArrayReductionModePerThread,
+     OpenACC_ArrayReductionModeWorkerRow,
+     OpenACC_ArrayReductionModeBlockSharedNoOp]> {
+  let genSpecializedAttr = 0;
+  let cppNamespace = "::mlir::acc";
+}
+
+def OpenACC_ArrayReductionModeAttr
+    : EnumAttr<OpenACC_Dialect, OpenACC_ArrayReductionMode,
+               "array_reduction_mode"> {
+  let assemblyFormat = [{ ```<` $value `>` }];
+}
+
+def OpenACC_PrivateStorageKindPerThread
+    : I32EnumAttrCase<"PerThread", 0, "per_thread">;
+def OpenACC_PrivateStorageKindWorkerRow
+    : I32EnumAttrCase<"WorkerRow", 1, "worker_row">;
+def OpenACC_PrivateStorageKindBlockShared
+    : I32EnumAttrCase<"BlockShared", 2, "block_shared">;
+def OpenACC_PrivateStorageKindIndexedGlobal
+    : I32EnumAttrCase<"IndexedGlobal", 3, "indexed_global">;
+
+def OpenACC_PrivateStorageKind : I32EnumAttr<
+    "PrivateStorageKind", "Private storage materialization policy",
+    [OpenACC_PrivateStorageKindPerThread,
+     OpenACC_PrivateStorageKindWorkerRow,
+     OpenACC_PrivateStorageKindBlockShared,
+     OpenACC_PrivateStorageKindIndexedGlobal]> {
+  let genSpecializedAttr = 0;
+  let cppNamespace = "::mlir::acc";
+}
+
+def OpenACC_PrivateStorageKindAttr
+    : EnumAttr<OpenACC_Dialect, OpenACC_PrivateStorageKind,
+               "private_storage_kind"> {
+  let assemblyFormat = [{ ```<` $value `>` }];
+}
+
 #endif // OPENACCCG_ATTRIBUTES

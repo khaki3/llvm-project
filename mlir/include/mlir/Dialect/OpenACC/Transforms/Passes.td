@@ -27,6 +27,10 @@ def AccDeviceTypeOption : Option<"deviceType", "device-type",
        clEnumValN(mlir::acc::DeviceType::Radeon, "radeon", "radeon"))
     }]>;
 
+def AccMaxThreadPrivateStackOption
+    : Option<"maxThreadPrivateStack", "max-thread-private-stack", "int64_t",
+             "16384", "Maximum thread-private stack allocation in bytes.">;
+
 //===----------------------------------------------------------------------===//
 // Pass definitions
 //===----------------------------------------------------------------------===//
@@ -541,6 +545,24 @@ def ACCBindRoutine
   let options = [ AccDeviceTypeOption ];
 }
 
+def ACCPrepareCGToGPU
+    : InterfacePass<"acc-prepare-cg-to-gpu", "mlir::FunctionOpInterface"> {
+  let summary = "Decide OpenACC GPU lowering policy";
+  let description = [{
+    Resolves storage ownership on final OpenACC codegen IR and records explicit
+    policy attributes consumed by ACCCGToGPU.
+  }];
+  let options = [
+    AccMaxThreadPrivateStackOption
+  ];
+  let dependentDialects = [
+    "mlir::acc::OpenACCDialect",
+    "mlir::arith::ArithDialect",
+    "mlir::memref::MemRefDialect",
+    "mlir::scf::SCFDialect"
+  ];
+}
+
 def ACCCGToGPU : InterfacePass<"acc-cg-to-gpu", "mlir::FunctionOpInterface"> {
   let summary = "Lower acc.compute_region to gpu.launch";
   let description = [{
@@ -553,9 +575,7 @@ def ACCCGToGPU : InterfacePass<"acc-cg-to-gpu", "mlir::FunctionOpInterface"> {
     Option<"maxWorkgroupSharedMemory", "max-workgroup-shared-memory", "int64_t",
         "49152",
         "Maximum workgroup shared memory budget in bytes.">,
-    Option<"maxThreadPrivateStack", "max-thread-private-stack", "int64_t",
-        "16384",
-        "Maximum thread-private stack allocation in bytes.">,
+    AccMaxThreadPrivateStackOption,
     Option<"subgroupSize", "subgroup-size", "int64_t", "32",
         "Subgroup size used for block-dimension alignment and reductions.">
   ];

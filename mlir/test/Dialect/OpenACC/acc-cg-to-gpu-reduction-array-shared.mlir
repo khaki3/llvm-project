@@ -1,4 +1,4 @@
-// RUN: mlir-opt %s --pass-pipeline="builtin.module(func.func(acc-cg-to-gpu))" | FileCheck %s
+// RUN: mlir-opt %s --pass-pipeline="builtin.module(func.func(acc-prepare-cg-to-gpu,acc-cg-to-gpu))" | FileCheck %s
 
 // A block-shared array accumulator (too large for a per-thread stack alloca)
 // must NOT run a per-element gpu.all_reduce: all threads share the slot, so

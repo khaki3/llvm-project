@@ -2,6 +2,7 @@ add_mlir_dialect_library(MLIROpenACCTransforms
   ACCBindRoutine.cpp
   ACCCGToGPU.cpp
   ACCComputeLowering.cpp
+  ACCPrepareCGToGPU.cpp
   ACCRoutineLowering.cpp
   ACCRoutineToGPUFunc.cpp
   ACCDeclareGPUModuleInsertion.cpp
@@ -37,6 +38,7 @@ add_mlir_dialect_library(MLIROpenACCTransforms
   MLIRArithDialect
   MLIRArithUtils
   MLIRComplexDialect
+  MLIRDialectUtils
   MLIROpenACCAnalysis
   MLIROpenACCDialect
   MLIROpenACCUtils
