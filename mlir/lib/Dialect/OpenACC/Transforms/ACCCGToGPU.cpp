@@ -1013,26 +1013,23 @@ LogicalResult ACCCGToGPULowering::rewrite() {
     const int64_t subgroupSize = options.subgroupSize;
     const int64_t subgroupAlignMask = subgroupSize - 1;
 
-    // Adjust blockDim.x to be a multiple of subgroupSize. This is required
-    // because:
-    // - Subgroup reductions (gpu.all_reduce) require full subgroups
-    // - Per-row workgroup barriers require blockDim.x aligned to subgroupSize
-    bool isShuffleEnabled = false;
+    // Keep subgroups within ThreadY rows. ThreadX reductions support a partial
+    // final subgroup and do not require padding.
+    bool hasThreadYReduction = false;
 
     launch.walk([&](gpu::AllReduceOp allReduce) -> WalkResult {
       ArrayRef<mlir::acc::GPUParallelDimAttr> parDims =
           mlir::acc::getParDimsAttr(allReduce).getArray();
       for (auto parDim : parDims) {
-        if (parDim.isThreadX() || parDim.isThreadY()) {
-          // Shuffle are enabled. Need to adjust the ThreadX length.
-          isShuffleEnabled = true;
+        if (parDim.isThreadY()) {
+          hasThreadYReduction = true;
           return WalkResult::interrupt();
         }
       }
       return WalkResult::advance();
     });
     // Also check if called routines have ThreadY reductions
-    if (!isShuffleEnabled) {
+    if (!hasThreadYReduction) {
       launch.walk([&](func::CallOp callOp) -> WalkResult {
         if (gpu::GPUFuncOp callee =
                 callOp->getParentOfType<ModuleOp>()
@@ -1041,20 +1038,20 @@ LogicalResult ACCCGToGPULowering::rewrite() {
             ArrayRef<mlir::acc::GPUParallelDimAttr> parDims =
                 mlir::acc::getParDimsAttr(allReduce).getArray();
             for (auto parDim : parDims) {
-              if (parDim.isThreadX() || parDim.isThreadY()) {
-                isShuffleEnabled = true;
+              if (parDim.isThreadY()) {
+                hasThreadYReduction = true;
                 return WalkResult::interrupt();
               }
             }
             return WalkResult::advance();
           });
         }
-        return isShuffleEnabled ? WalkResult::interrupt()
-                                : WalkResult::advance();
+        return hasThreadYReduction ? WalkResult::interrupt()
+                                   : WalkResult::advance();
       });
     }
 
-    if (isShuffleEnabled || hasThreadYBarrier) {
+    if (hasThreadYReduction || hasThreadYBarrier) {
       rewriter.setInsertionPoint(launch);
 
       Value curBlockDimX = launch.getBlockSizeX();
@@ -1069,7 +1066,7 @@ LogicalResult ACCCGToGPULowering::rewrite() {
         std::string blockDimXValStr = getName(curBlockDimX);
         std::string blockDimYValStr = getName(curBlockDimY);
         llvm::StringRef kind =
-            isShuffleEnabled ? "Shuffle reduction" : "ThreadY barrier";
+            hasThreadYReduction ? "ThreadY reduction" : "ThreadY barrier";
         return (llvm::Twine(kind) +
                 " is generated while adjusting the number of threads into "
                 "groups of " +

@@ -215,6 +215,26 @@ func.func @dynamic_rank_two_array_reduction(%local: memref<?x?xi32>, %extent: in
   return
 }
 
+// CHECK-LABEL: func.func @thread_x_partial_subgroup
+// CHECK-NOT: arith.constant 31 : index
+// CHECK: gpu.launch
+// CHECK-SAME: threads({{.*}}) in (%{{.*}} = %arg0,
+// CHECK: gpu.all_reduce add
+func.func @thread_x_partial_subgroup(%width: index) {
+  %c1 = arith.constant 1 : index
+  %bx = acc.par_width %c1 {par_dim = #acc.par_dim<block_x>}
+  %tx = acc.par_width %width {par_dim = #acc.par_dim<thread_x>}
+  acc.compute_region launch(%kbx = %bx, %ktx = %tx) {
+    %c2 = arith.constant 2 : index
+    %local = memref.alloca() : memref<2xi32>
+    %bounds = acc.bounds extent(%c2 : index)
+    acc.reduction_accumulate_array %local bounds(%bounds) <add>
+        : memref<2xi32> {par_dims = #acc<par_dims[block_x, thread_x]>}
+    acc.yield
+  } {origin = "acc.parallel"}
+  return
+}
+
 // CHECK-LABEL: func.func @rank_two_partial_bounds_strided_layout
 // CHECK: %[[LB:.*]] = arith.constant 5 : index
 // CHECK: %[[STEP:.*]] = arith.constant 2 : index
