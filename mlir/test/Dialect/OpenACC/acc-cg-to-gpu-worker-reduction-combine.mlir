@@ -185,3 +185,70 @@ func.func @worker_combine_in_scf_if(%result: memref<i32>) {
   }
   return
 }
+
+// A block_y+thread_y worker accumulator filled by an inner block-scoped combine
+// holds a distinct partial per worker row. The outer combine into global must
+// keep ThreadY active; predicating on thread_y==0 would drop non-zero rows.
+// CHECK-LABEL: func.func @inner_block_combine_fed_worker_to_global
+// CHECK: gpu.launch {{.*}} threads([[IB_TX:%[^,]+]], [[IB_TY:%[^,]+]],
+// CHECK-NOT: arith.cmpi eq, [[IB_TY]]
+// CHECK: %[[IB_TX_ZERO:.*]] = arith.cmpi eq, [[IB_TX]],
+// CHECK-NOT: arith.andi
+// CHECK: scf.if %[[IB_TX_ZERO]]
+// CHECK: acc.atomic.update
+func.func @inner_block_combine_fed_worker_to_global(%result: memref<i32>) {
+  %c1 = arith.constant 1 : index
+  %c4 = arith.constant 4 : index
+  %c32 = arith.constant 32 : index
+  %block_y = acc.par_width %c1 {par_dim = #acc.par_dim<block_y>}
+  %block_x = acc.par_width %c1 {par_dim = #acc.par_dim<block_x>}
+  %thread_y = acc.par_width %c4 {par_dim = #acc.par_dim<thread_y>}
+  %thread_x = acc.par_width %c32 {par_dim = #acc.par_dim<thread_x>}
+  acc.kernel_environment {
+    %worker_priv = acc.privatize [#acc<par_dims[block_y, thread_y]>]
+        : () -> !acc.private_type<memref<i32>>
+    %vector_priv = acc.privatize [#acc<par_dims[block_x, thread_x]>]
+        : () -> !acc.private_type<memref<i32>>
+    acc.compute_region launch(%by = %block_y, %bx = %block_x,
+                              %ty = %thread_y, %tx = %thread_x)
+        ins(%worker_arg = %worker_priv, %vector_arg = %vector_priv,
+            %result_arg = %result)
+        : (!acc.private_type<memref<i32>>, !acc.private_type<memref<i32>>,
+           memref<i32>) {
+      %c0 = arith.constant 0 : index
+      %c1_inner = arith.constant 1 : index
+      %c0_i32 = arith.constant 0 : i32
+      scf.parallel (%block_y_iv) = (%c0) to (%by) step (%c1_inner) {
+        %worker = acc.private_local %worker_arg
+            {acc.par_dims = #acc<par_dims[block_y, thread_y]>}
+            : (!acc.private_type<memref<i32>>) -> memref<i32>
+        memref.store %c0_i32, %worker[] : memref<i32>
+        scf.parallel (%worker_iv) = (%c0) to (%ty) step (%c1_inner) {
+          scf.parallel (%block_x_iv) = (%c0) to (%bx) step (%c1_inner) {
+            %vector = acc.private_local %vector_arg
+                {acc.par_dims = #acc<par_dims[block_x, thread_x]>}
+                : (!acc.private_type<memref<i32>>) -> memref<i32>
+            memref.store %c0_i32, %vector[] : memref<i32>
+            scf.parallel (%vector_iv) = (%c0) to (%tx) step (%c1_inner) {
+              scf.reduce
+            } {acc.par_dims = #acc<par_dims[thread_x]>}
+            acc.predicate_region {
+              // Inner block-scoped combine fills a distinct worker-row partial.
+              acc.reduction_combine %vector into %worker <add> : memref<i32>
+                  {acc.par_dims = #acc<par_dims[block_x, thread_x]>}
+            }
+            scf.reduce
+          } {acc.par_dims = #acc<par_dims[block_x]>}
+          scf.reduce
+        } {acc.par_dims = #acc<par_dims[thread_y]>}
+        acc.predicate_region {
+          acc.reduction_combine %worker into %result_arg <add> : memref<i32>
+              {acc.par_dims = #acc<par_dims[block_y, thread_y]>}
+        }
+        scf.reduce
+      } {acc.par_dims = #acc<par_dims[block_y]>}
+      acc.yield
+    } {origin = "acc.parallel"}
+  }
+  return
+}
