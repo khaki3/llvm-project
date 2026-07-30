@@ -40,7 +40,13 @@ def FIRToLLVMLowering : Pass<"fir-to-llvm-ir", "mlir::ModuleOp"> {
     Option<"typeDescriptorsRenamedForAssembly",
            "type-descriptors-renamed-for-assembly", "bool", /*default=*/"false",
            "Global variables created to describe derived types "
-           "have been renamed to avoid special symbols in their names.">
+           "have been renamed to avoid special symbols in their names.">,
+    Option<"unifiedHeapAllocSuffix", "unified-heap-alloc-suffix", "std::string",
+           /*default=*/"", "Suffix of the allocator entry points used for "
+           "allocations marked with the unified heap allocation mode.">,
+    Option<"managedHeapAllocSuffix", "managed-heap-alloc-suffix", "std::string",
+           /*default=*/"", "Suffix of the allocator entry points used for "
+           "allocations marked with the managed heap allocation mode.">
   ];
 }
 

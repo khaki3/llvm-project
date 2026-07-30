@@ -1318,51 +1318,33 @@ getMallocInModule(ModuleOp mod, fir::AllocMemOp op,
   return mlir::SymbolRefAttr::get(mallocDecl);
 }
 
-/// Allocator entry points for an allocation marked by the allocation placement
-/// passes under -gpu=mem:unified|managed. Only marked fir.allocmem/fir.freemem
-/// pairs are routed: memory that the Fortran runtime allocated must keep being
-/// released by libc free, and vice versa.
-static llvm::StringRef getHeapAllocName(mlir::Operation *op,
-                                        llvm::StringRef plain,
-                                        llvm::StringRef unified,
-                                        llvm::StringRef managed) {
-  // Device modules keep libc names; the indirect entry points are host-side.
+/// Allocator entry point for an allocation marked by the allocation placement
+/// passes with a heap allocation mode: the libc name plus the mode suffix from
+/// the pass options, e.g. malloc -> malloc_unified. Only marked
+/// fir.allocmem/fir.freemem pairs are routed, since memory the Fortran runtime
+/// allocated must keep being released by libc free, and vice versa.
+static std::string getHeapAllocName(mlir::Operation *op, llvm::StringRef plain,
+                                    const fir::FIRToLLVMPassOptions &options) {
+  // Device modules keep libc names; the mode entry points are host-side.
   if (op->getParentOfType<mlir::gpu::GPUModuleOp>())
-    return plain;
+    return plain.str();
   switch (fir::getCudaHeapAllocMode(op)) {
   case fir::CudaHeapAllocMode::Unified:
-    return unified;
+    return (plain + options.unifiedHeapAllocSuffix).str();
   case fir::CudaHeapAllocMode::Managed:
-    return managed;
+    return (plain + options.managedHeapAllocSuffix).str();
   case fir::CudaHeapAllocMode::None:
-    return plain;
+    return plain.str();
   }
   llvm_unreachable("unexpected CudaHeapAllocMode");
-}
-
-static llvm::StringRef getHostHeapMallocName(mlir::Operation *op) {
-  return getHeapAllocName(op, "malloc", "malloc_unified", "malloc_managed");
-}
-
-static llvm::StringRef getHostHeapFreeName(mlir::Operation *op) {
-  return getHeapAllocName(op, "free", "free_unified", "free_managed");
-}
-
-static llvm::StringRef getHostHeapAlignedAllocName(mlir::Operation *op) {
-  return getHeapAllocName(op, "aligned_alloc", "aligned_alloc_unified",
-                          "aligned_alloc_managed");
-}
-
-static llvm::StringRef getHostHeapPosixMemalignName(mlir::Operation *op) {
-  return getHeapAllocName(op, "posix_memalign", "posix_memalign_unified",
-                          "posix_memalign_managed");
 }
 
 /// Return the LLVMFuncOp corresponding to the standard malloc call.
 static mlir::SymbolRefAttr getMalloc(fir::AllocMemOp op,
                                      mlir::ConversionPatternRewriter &rewriter,
-                                     mlir::Type indexType) {
-  llvm::StringRef name = getHostHeapMallocName(op);
+                                     mlir::Type indexType,
+                                     const fir::FIRToLLVMPassOptions &options) {
+  std::string name = getHeapAllocName(op, "malloc", options);
   if (auto mod = op->getParentOfType<mlir::gpu::GPUModuleOp>())
     return getMallocInModule(mod, op, rewriter, indexType, name);
   auto mod = op->getParentOfType<mlir::ModuleOp>();
@@ -1391,8 +1373,9 @@ static mlir::SymbolRefAttr getAlignedAllocInModule(
 
 static mlir::SymbolRefAttr
 getAlignedAlloc(fir::AllocMemOp op, mlir::ConversionPatternRewriter &rewriter,
-                mlir::Type indexType) {
-  llvm::StringRef name = getHostHeapAlignedAllocName(op);
+                mlir::Type indexType,
+                const fir::FIRToLLVMPassOptions &options) {
+  std::string name = getHeapAllocName(op, "aligned_alloc", options);
   if (auto mod = op->getParentOfType<mlir::gpu::GPUModuleOp>())
     return getAlignedAllocInModule(mod, op, rewriter, indexType, name);
   auto mod = op->getParentOfType<mlir::ModuleOp>();
@@ -1423,8 +1406,9 @@ static mlir::SymbolRefAttr getPosixMemalignInModule(
 
 static mlir::SymbolRefAttr
 getPosixMemalign(fir::AllocMemOp op, mlir::ConversionPatternRewriter &rewriter,
-                 mlir::Type indexType) {
-  llvm::StringRef name = getHostHeapPosixMemalignName(op);
+                 mlir::Type indexType,
+                 const fir::FIRToLLVMPassOptions &options) {
+  std::string name = getHeapAllocName(op, "posix_memalign", options);
   if (auto mod = op->getParentOfType<mlir::gpu::GPUModuleOp>())
     return getPosixMemalignInModule(mod, op, rewriter, indexType, name);
   auto mod = op->getParentOfType<mlir::ModuleOp>();
@@ -1511,7 +1495,8 @@ struct AllocMemOpConversion : public fir::FIROpConversion<fir::AllocMemOp> {
           mlir::Value nullPtr =
               mlir::LLVM::ZeroOp::create(rewriter, loc, ptrTy);
           mlir::LLVM::StoreOp::create(rewriter, loc, nullPtr, memptr);
-          heap->setAttr("callee", getPosixMemalign(heap, rewriter, mallocTy));
+          heap->setAttr("callee", getPosixMemalign(heap, rewriter, mallocTy,
+                                                   this->options));
           mlir::LLVM::CallOp::create(
               rewriter, loc,
               mlir::TypeRange{
@@ -1533,7 +1518,8 @@ struct AllocMemOpConversion : public fir::FIROpConversion<fir::AllocMemOp> {
                                   ~static_cast<std::int64_t>(*alignment - 1));
         mlir::Value roundedSize = mlir::LLVM::AndOp::create(
             rewriter, loc, mallocTy, sizePlus, notAlignMinusOne);
-        heap->setAttr("callee", getAlignedAlloc(heap, rewriter, mallocTy));
+        heap->setAttr("callee",
+                      getAlignedAlloc(heap, rewriter, mallocTy, this->options));
         rewriter.replaceOpWithNewOp<mlir::LLVM::CallOp>(
             heap, ::getLlvmPtrType(heap.getContext()),
             mlir::ValueRange{alignVal, roundedSize},
@@ -1542,7 +1528,7 @@ struct AllocMemOpConversion : public fir::FIROpConversion<fir::AllocMemOp> {
       }
     }
 
-    heap->setAttr("callee", getMalloc(heap, rewriter, mallocTy));
+    heap->setAttr("callee", getMalloc(heap, rewriter, mallocTy, this->options));
     rewriter.replaceOpWithNewOp<mlir::LLVM::CallOp>(
         heap, ::getLlvmPtrType(heap.getContext()), size,
         addLLVMOpBundleAttrs(rewriter, heap->getAttrs(), 1));
@@ -1586,8 +1572,9 @@ getFreeInModule(ModuleOp mod, fir::FreeMemOp op,
 }
 
 static mlir::SymbolRefAttr getFree(fir::FreeMemOp op,
-                                   mlir::ConversionPatternRewriter &rewriter) {
-  llvm::StringRef name = getHostHeapFreeName(op);
+                                   mlir::ConversionPatternRewriter &rewriter,
+                                   const fir::FIRToLLVMPassOptions &options) {
+  std::string name = getHeapAllocName(op, "free", options);
   if (auto mod = op->getParentOfType<mlir::gpu::GPUModuleOp>())
     return getFreeInModule(mod, op, rewriter, name);
   auto mod = op->getParentOfType<mlir::ModuleOp>();
@@ -1613,7 +1600,7 @@ struct FreeMemOpConversion : public fir::FIROpConversion<fir::FreeMemOp> {
   matchAndRewrite(fir::FreeMemOp freemem, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
     mlir::Location loc = freemem.getLoc();
-    freemem->setAttr("callee", getFree(freemem, rewriter));
+    freemem->setAttr("callee", getFree(freemem, rewriter, this->options));
     mlir::LLVM::CallOp::create(
         rewriter, loc, mlir::TypeRange{},
         mlir::ValueRange{adaptor.getHeapref()},
@@ -5002,6 +4989,11 @@ public:
     if (typeDescriptorsRenamedForAssembly)
       options.typeDescriptorsRenamedForAssembly =
           typeDescriptorsRenamedForAssembly;
+
+    if (!unifiedHeapAllocSuffix.empty())
+      options.unifiedHeapAllocSuffix = unifiedHeapAllocSuffix;
+    if (!managedHeapAllocSuffix.empty())
+      options.managedHeapAllocSuffix = managedHeapAllocSuffix;
 
     // Run dynamic pass pipeline for converting Math dialect
     // operations into other dialects (llvm, func, etc.).
