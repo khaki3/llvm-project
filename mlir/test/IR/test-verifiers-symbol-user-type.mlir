@@ -93,3 +93,30 @@ module {
     attr = 0 : i32
   }> : () -> ()
 }
+
+// -----
+
+// An already-verified nested type must not hide a sibling that is still
+// invalid: the first op verifies the inner symbol_ref, and the second reaches
+// a bad symbol beside it.
+
+module {
+  func.func private @existing_symbol()
+
+  "test.type_producer"() : () -> tuple<!test.symbol_ref<@existing_symbol>>
+  // expected-error@+1 {{'@non_existent_symbol' does not reference a valid symbol}}
+  "test.type_producer"() : () -> tuple<!test.symbol_ref<@existing_symbol>, !test.symbol_ref<@non_existent_symbol>>
+}
+
+// -----
+
+// Same, with the already-verified type buried several levels deep, so the
+// pruned subtree is larger than the one that still has to be walked.
+
+module {
+  func.func private @existing_symbol()
+
+  "test.type_producer"() : () -> tuple<tuple<tuple<!test.symbol_ref<@existing_symbol>>>>
+  // expected-error@+1 {{'@non_existent_symbol' does not reference a valid symbol}}
+  "test.type_producer"() : () -> tuple<tuple<tuple<!test.symbol_ref<@existing_symbol>>>, !test.symbol_ref<@non_existent_symbol>>
+}

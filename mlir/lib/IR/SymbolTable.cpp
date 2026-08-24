@@ -489,9 +489,30 @@ static LogicalResult verifyOpTypeSymbolUses(Operation *op,
   // Walk `type` and any nested type parameters reachable from it, verifying
   // each not-yet-seen type and interrupting on the first failure.
   auto verify = [&](Type type) {
+    // A type in the set has already been walked to completion, so walking it
+    // again would allocate a walker only to find nothing new. See below for
+    // why a set hit implies the whole nested closure was verified.
+    if (verifiedTypes.contains(type))
+      return WalkResult::advance();
     return type.walk<WalkOrder::PreOrder>([&](Type nestedType) {
+      // Skip rather than advance: the nested types are already verified, so
+      // descending would re-walk a verified subtree. AttrTypeWalker maps a
+      // skip to an advance for siblings, so only the subtree is pruned.
+      //
+      // This is sound because AttrTypeWalker memoizes each element as it
+      // enters it, before running this callback, which is also what makes
+      // recursive types terminate. So within one walk this callback never sees
+      // the same type twice, and a set hit always comes from an earlier walk
+      // that already inserted the whole nested closure.
+      //
+      // Types are inserted in pre-order, before their subtree is walked, so an
+      // interrupted walk can leave a type in the set whose subtree was never
+      // verified -- but an interrupt aborts this whole scope and discards the
+      // set, so no later lookup can observe it. If this verifier is ever
+      // changed to continue past the first invalid symbol use, that no longer
+      // holds and this skip must become an advance again.
       if (!verifiedTypes.insert(nestedType))
-        return WalkResult::advance();
+        return WalkResult::skip();
       if (auto user = dyn_cast<SymbolUserTypeInterface>(nestedType))
         if (failed(user.verifySymbolUses(op, symbolTable)))
           return WalkResult::interrupt();
