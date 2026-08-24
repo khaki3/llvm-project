@@ -551,11 +551,32 @@ LogicalResult detail::verifySymbolTable(Operation *op) {
 
   // Verify any nested symbol user operations.
   SymbolTableCollection symbolTable;
-  // walkSymbolTable does not descend into nested symbol tables, so every
-  // operation visited here shares the same nearest symbol table. A uniqued
-  // attribute or type therefore resolves its symbol uses identically
-  // regardless of which operation anchors the lookup, so each is verified at
-  // most once across the whole scope.
+  // These sets memoize what has already been verified in this scope, so that a
+  // uniqued attribute or type shared across many positions or operations is
+  // verified once rather than once per occurrence. They are local to this call,
+  // so nothing carries over into a nested symbol table's own verification.
+  //
+  // FIXME: Memoizing across operations is not strictly sound.
+  // walkSymbolTable does not descend into a nested symbol table's regions, but
+  // it does invoke the callback on the nested symbol table op itself, and
+  // getNearestSymbolTable returns that op rather than this one. So one visited
+  // op can anchor its lookups in a different scope than its siblings, and a
+  // shared type verified against this scope suppresses the check against the
+  // inner one:
+  //
+  //   module {
+  //     func.func private @foo()
+  //     // Anchored here; seeds the cache.
+  //     "test.type_producer"() : () -> !test.symbol_ref<@foo>
+  //     // Anchored in its own scope, where @foo is not visible, but the
+  //     // uniqued type is already cached, so this goes unchecked.
+  //     "test.symbol_scope"() ({
+  //       "test.finish"() : () -> ()
+  //     }) {t = !test.symbol_ref<@foo>} : () -> ()
+  //   }
+  //
+  // Dropping the symbol table op from these caches, or keying them on the
+  // anchoring scope, would close the hole.
   SetVector<Attribute> verifiedAttrs;
   SetVector<Type> verifiedTypes;
   auto verifySymbolUserFn = [&](Operation *op) -> std::optional<WalkResult> {
