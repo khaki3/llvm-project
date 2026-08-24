@@ -38,7 +38,12 @@ void dumpTree(CompilerInstance &ci) {
   llvm::outs() << "========================";
   llvm::outs() << " Flang: parse tree dump ";
   llvm::outs() << "========================\n";
-  parser::DumpTree(llvm::outs(), parseTree, &ci.getInvocation().getAsFortran());
+  // Dump the Program itself rather than the std::optional wrapping it, so that
+  // this shares the DumpTree<Program> instantiation in the parser library
+  // instead of instantiating the whole parse-tree walk again here.
+  if (parseTree)
+    parser::DumpTree(llvm::outs(), *parseTree,
+                     &ci.getInvocation().getAsFortran());
 }
 
 void dumpProvenance(CompilerInstance &ci) {

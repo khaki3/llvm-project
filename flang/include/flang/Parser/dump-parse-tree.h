@@ -1158,5 +1158,12 @@ llvm::raw_ostream &DumpTree(llvm::raw_ostream &out, const T &x,
   return out;
 }
 
+// Walking a whole Program instantiates the visitor for every node type in the
+// parse tree, which is by far the most expensive specialization to compile.
+// Instantiate it once in dump-parse-tree.cpp instead of in every caller, as
+// unparse.h already does for Unparse.
+extern template llvm::raw_ostream &DumpTree<Program>(llvm::raw_ostream &out,
+    const Program &x, const AnalyzedObjectsAsFortran *asFortran);
+
 } // namespace Fortran::parser
 #endif // FORTRAN_PARSER_DUMP_PARSE_TREE_H_

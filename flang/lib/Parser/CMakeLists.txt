@@ -5,6 +5,7 @@ add_flang_library(FortranParser
   char-set.cpp
   characters.cpp
   debug-parser.cpp
+  dump-parse-tree.cpp
   executable-parsers.cpp
   expr-parsers.cpp
   instrumented-parser.cpp
