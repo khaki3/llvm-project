@@ -120,3 +120,28 @@ module {
   // expected-error@+1 {{'@non_existent_symbol' does not reference a valid symbol}}
   "test.type_producer"() : () -> tuple<tuple<tuple<!test.symbol_ref<@existing_symbol>>>, !test.symbol_ref<@non_existent_symbol>>
 }
+
+// -----
+
+// Two operations sharing one uniqued attribute dictionary: the dictionary is
+// walked once, and the invalid symbol is still reported.
+
+module {
+  // expected-error@+1 {{'@non_existent_symbol' does not reference a valid symbol}}
+  "test.type_producer"() {type = !test.symbol_ref<@non_existent_symbol>} : () -> i32
+  "test.type_producer"() {type = !test.symbol_ref<@non_existent_symbol>} : () -> i32
+}
+
+// -----
+
+// A shared valid dictionary must not suppress a later, distinct one that is
+// invalid.
+
+module {
+  func.func private @existing_symbol()
+
+  "test.type_producer"() {type = !test.symbol_ref<@existing_symbol>} : () -> i32
+  "test.type_producer"() {type = !test.symbol_ref<@existing_symbol>} : () -> i32
+  // expected-error@+1 {{'@non_existent_symbol' does not reference a valid symbol}}
+  "test.type_producer"() {type = !test.symbol_ref<@non_existent_symbol>} : () -> i32
+}

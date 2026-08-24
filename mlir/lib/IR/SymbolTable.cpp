@@ -478,14 +478,15 @@ raw_ostream &mlir::operator<<(raw_ostream &os,
 
 /// Verify the symbol uses held by the types owned by `op`: its operand,
 /// result, and block-argument types, and any types nested within its
-/// attributes. `op` is the anchor used for symbol lookups. `verifiedTypes`
-/// records the types already verified within the current symbol table so that
-/// each type, which may be uniqued and shared across many positions or
-/// operations, is verified at most once. Verification fails fast on the first
-/// invalid symbol use.
-static LogicalResult verifyOpTypeSymbolUses(Operation *op,
-                                            SymbolTableCollection &symbolTable,
-                                            SetVector<Type> &verifiedTypes) {
+/// attributes. `op` is the anchor used for symbol lookups. `verifiedTypes` and
+/// `verifiedAttrDicts` record the types and attribute dictionaries already
+/// verified within the current symbol table so that each one, which may be
+/// uniqued and shared across many positions or operations, is verified at most
+/// once. Verification fails fast on the first invalid symbol use.
+static LogicalResult
+verifyOpTypeSymbolUses(Operation *op, SymbolTableCollection &symbolTable,
+                       SetVector<Type> &verifiedTypes,
+                       SetVector<Attribute> &verifiedAttrDicts) {
   // Walk `type` and any nested type parameters reachable from it, verifying
   // each not-yet-seen type and interrupting on the first failure.
   auto verify = [&](Type type) {
@@ -532,13 +533,23 @@ static LogicalResult verifyOpTypeSymbolUses(Operation *op,
         if (verify(argument.getType()).wasInterrupted())
           return failure();
 
-  // Verify types nested within the operation's attributes.
-  WalkResult attrResult =
-      op->getAttrDictionary().walk<WalkOrder::PreOrder>([&](Type type) {
-        if (verify(type).wasInterrupted())
-          return WalkResult::interrupt();
-        return WalkResult::advance();
-      });
+  // Verify types nested within the operation's attributes. Dictionaries are
+  // uniqued by content, so two operations share one only if every type inside
+  // is also shared; after the first walk those types are all in
+  // `verifiedTypes` and a second walk would verify nothing. Walking each
+  // dictionary once per scope therefore only saves the traversal.
+  //
+  // Note that this walk feeds `verify` alone. If an attribute-level check is
+  // added here, caching per dictionary would no longer be equivalent to
+  // caching per type, and this dedup must be revisited.
+  DictionaryAttr attrDict = op->getAttrDictionary();
+  if (attrDict.empty() || !verifiedAttrDicts.insert(attrDict))
+    return success();
+  WalkResult attrResult = attrDict.walk<WalkOrder::PreOrder>([&](Type type) {
+    if (verify(type).wasInterrupted())
+      return WalkResult::interrupt();
+    return WalkResult::advance();
+  });
   return failure(attrResult.wasInterrupted());
 }
 
@@ -600,6 +611,7 @@ LogicalResult detail::verifySymbolTable(Operation *op) {
   // anchoring scope, would close the hole.
   SetVector<Attribute> verifiedAttrs;
   SetVector<Type> verifiedTypes;
+  SetVector<Attribute> verifiedAttrDicts;
   auto verifySymbolUserFn = [&](Operation *op) -> std::optional<WalkResult> {
     if (SymbolUserOpInterface user = dyn_cast<SymbolUserOpInterface>(op))
       if (failed(user.verifySymbolUses(symbolTable)))
@@ -612,7 +624,8 @@ LogicalResult detail::verifySymbolTable(Operation *op) {
           return WalkResult::interrupt();
       }
     }
-    if (failed(verifyOpTypeSymbolUses(op, symbolTable, verifiedTypes)))
+    if (failed(verifyOpTypeSymbolUses(op, symbolTable, verifiedTypes,
+                                      verifiedAttrDicts)))
       return WalkResult::interrupt();
     return WalkResult::advance();
   };
@@ -656,14 +669,16 @@ LogicalResult detail::verifySymbol(Operation *op) {
 static WalkResult
 walkSymbolRefs(Operation *op,
                function_ref<WalkResult(SymbolTable::SymbolUse)> callback) {
-  return op->getAttrDictionary().walk<WalkOrder::PreOrder>(
-      [&](SymbolRefAttr symbolRef) {
-        if (callback({op, symbolRef}).wasInterrupted())
-          return WalkResult::interrupt();
+  DictionaryAttr attrDict = op->getAttrDictionary();
+  if (attrDict.empty())
+    return WalkResult::advance();
+  return attrDict.walk<WalkOrder::PreOrder>([&](SymbolRefAttr symbolRef) {
+    if (callback({op, symbolRef}).wasInterrupted())
+      return WalkResult::interrupt();
 
-        // Don't walk nested references.
-        return WalkResult::skip();
-      });
+    // Don't walk nested references.
+    return WalkResult::skip();
+  });
 }
 
 /// Walk all of the uses, for any symbol, that are nested within the given
