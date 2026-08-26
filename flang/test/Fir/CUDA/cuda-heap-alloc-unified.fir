@@ -15,9 +15,10 @@
 // STACK-NOT: fir.allocmem !fir.array<?xf32>, %{{.*}} {bindc_name
 // STACK-NOT: fir.allocmem !fir.char
 
-// Under fir.cuda_heap_alloc = "unified", named automatic arrays move to the
-// heap and are marked. Only marked allocations use malloc_unified: memory the
-// Fortran runtime allocated must keep being released by libc free.
+// Under fir.cuda_heap_alloc = "unified", a named automatic array whose host
+// address is handed to device code moves to the heap and is marked. Only marked
+// allocations use malloc_unified: memory the Fortran runtime allocated must
+// keep being released by libc free.
 
 // Declarations are emitted at the top of the module, before any function.
 // LLVM-DAG: llvm.func @malloc_unified(i64) -> !llvm.ptr
@@ -37,6 +38,20 @@ func.func @vla(%arg0: !fir.ref<i32>) {
   %0 = fir.load %arg0 : !fir.ref<i32>
   %1 = fir.convert %0 : (i32) -> index
   %2 = fir.alloca !fir.array<?xf32>, %1 {bindc_name = "a", uniq_name = "_QFvlaEa"}
+  %3 = acc.use_device varPtr(%2 : !fir.ref<!fir.array<?xf32>>) name("a") -> !fir.ref<!fir.array<?xf32>>
+  acc.host_data dataOperands(%3 : !fir.ref<!fir.array<?xf32>>) {
+    acc.terminator
+  }
+  return
+}
+
+// A local the device never sees the host address of stays on the stack: a data
+// clause maps and copies it, so host memory is enough.
+// HEAP-LABEL: func.func @vla_host_only(
+// HEAP: fir.alloca !fir.array<?xf32>
+// HEAP-NOT: fir.allocmem
+func.func @vla_host_only(%arg0: index) {
+  %0 = fir.alloca !fir.array<?xf32>, %arg0 {bindc_name = "a", uniq_name = "_QFvla_host_onlyEa"}
   return
 }
 
@@ -45,6 +60,10 @@ func.func @vla(%arg0: !fir.ref<i32>) {
 // HEAP: fir.allocmem !fir.char<1,?>(%{{.*}} : index) {{{.*}}fir.cuda_heap_alloc = "unified"
 func.func @autochar(%arg0: index) {
   %0 = fir.alloca !fir.char<1,?>(%arg0 : index) {bindc_name = "s", uniq_name = "_QFautocharEs"}
+  %1 = acc.use_device varPtr(%0 : !fir.ref<!fir.char<1,?>>) name("s") -> !fir.ref<!fir.char<1,?>>
+  acc.host_data dataOperands(%1 : !fir.ref<!fir.char<1,?>>) {
+    acc.terminator
+  }
   return
 }
 
@@ -54,6 +73,10 @@ func.func @autochar(%arg0: index) {
 // HEAP-NOT: fir.allocmem
 func.func @fixed() {
   %0 = fir.alloca !fir.array<128xf32> {bindc_name = "a", uniq_name = "_QFfixedEa"}
+  %1 = acc.use_device varPtr(%0 : !fir.ref<!fir.array<128xf32>>) name("a") -> !fir.ref<!fir.array<128xf32>>
+  acc.host_data dataOperands(%1 : !fir.ref<!fir.array<128xf32>>) {
+    acc.terminator
+  }
   return
 }
 
@@ -64,6 +87,10 @@ func.func @fixed() {
 // HEAP-NOT: fir.allocmem
 func.func @anon_temp(%arg0: index) {
   %0 = fir.alloca !fir.array<?xf32>, %arg0
+  %1 = acc.use_device varPtr(%0 : !fir.ref<!fir.array<?xf32>>) -> !fir.ref<!fir.array<?xf32>>
+  acc.host_data dataOperands(%1 : !fir.ref<!fir.array<?xf32>>) {
+    acc.terminator
+  }
   return
 }
 
@@ -73,6 +100,10 @@ func.func @anon_temp(%arg0: index) {
 // HEAP-NOT: fir.allocmem
 func.func @device_vla(%arg0: index) attributes {cuf.proc_attr = #cuf.cuda_proc<global>} {
   %0 = fir.alloca !fir.array<?xf32>, %arg0 {bindc_name = "a", uniq_name = "_QFdevice_vlaEa"}
+  %1 = acc.use_device varPtr(%0 : !fir.ref<!fir.array<?xf32>>) name("a") -> !fir.ref<!fir.array<?xf32>>
+  acc.host_data dataOperands(%1 : !fir.ref<!fir.array<?xf32>>) {
+    acc.terminator
+  }
   return
 }
 
@@ -83,6 +114,10 @@ func.func @device_vla(%arg0: index) attributes {cuf.proc_attr = #cuf.cuda_proc<g
 // HEAP: fir.allocmem !fir.array<?xf32>, %{{.*}} {{{.*}}fir.cuda_heap_alloc = "unified"
 func.func @host_device_vla(%arg0: index) attributes {cuf.proc_attr = #cuf.cuda_proc<host_device>} {
   %0 = fir.alloca !fir.array<?xf32>, %arg0 {bindc_name = "a", uniq_name = "_QFhost_device_vlaEa"}
+  %1 = acc.use_device varPtr(%0 : !fir.ref<!fir.array<?xf32>>) name("a") -> !fir.ref<!fir.array<?xf32>>
+  acc.host_data dataOperands(%1 : !fir.ref<!fir.array<?xf32>>) {
+    acc.terminator
+  }
   return
 }
 
@@ -93,6 +128,10 @@ func.func @host_device_vla(%arg0: index) attributes {cuf.proc_attr = #cuf.cuda_p
 // HEAP-NOT: fir.allocmem
 func.func @array_result(%arg0: index) {
   %0 = fir.alloca !fir.array<?xf32>, %arg0 {bindc_name = "res", fir.must_be_stack = true, uniq_name = "_QFarray_resultEres"}
+  %1 = acc.use_device varPtr(%0 : !fir.ref<!fir.array<?xf32>>) name("res") -> !fir.ref<!fir.array<?xf32>>
+  acc.host_data dataOperands(%1 : !fir.ref<!fir.array<?xf32>>) {
+    acc.terminator
+  }
   return
 }
 

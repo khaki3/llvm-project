@@ -2,9 +2,10 @@
 ! RUN: bbc -emit-hlfir -gpu=managed %s -o - | FileCheck %s --check-prefixes=CHECK,MANAGED
 ! RUN: bbc -emit-hlfir %s -o - | FileCheck %s --check-prefixes=CHECK,NOFLAG
 
-! Under -gpu=mem:unified|managed, dynamic automatic arrays are later moved to
-! the heap and allocated with malloc_unified / malloc_managed. Lowering only
-! records the mode on the module; symbols stay unmarked (no cudaDataAttr).
+! Under -gpu=mem:unified|managed, a dynamic automatic array whose host address
+! is given to device code is later moved to the heap and allocated with
+! malloc_unified / malloc_managed. Lowering only records the mode on the module;
+! symbols stay unmarked (no cudaDataAttr).
 
 ! UNIFIED: module attributes {{{.*}}fir.cuda_heap_alloc = "unified"
 ! MANAGED: module attributes {{{.*}}fir.cuda_heap_alloc = "managed"

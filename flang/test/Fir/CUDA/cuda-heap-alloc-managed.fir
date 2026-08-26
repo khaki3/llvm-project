@@ -22,9 +22,23 @@ func.func @vla(%arg0: !fir.ref<i32>) {
   %0 = fir.load %arg0 : !fir.ref<i32>
   %1 = fir.convert %0 : (i32) -> index
   %2 = fir.alloca !fir.array<?xf32>, %1 {bindc_name = "a", uniq_name = "_QFvlaEa"}
+  %3 = acc.use_device varPtr(%2 : !fir.ref<!fir.array<?xf32>>) name("a") -> !fir.ref<!fir.array<?xf32>>
+  acc.host_data dataOperands(%3 : !fir.ref<!fir.array<?xf32>>) {
+    acc.terminator
+  }
   return
 }
 
+// A local the device never sees the host address of stays on the stack.
+// HEAP-LABEL: func.func @vla_host_only(
+// HEAP: fir.alloca !fir.array<?xf32>
+// HEAP-NOT: fir.allocmem
+func.func @vla_host_only(%arg0: index) {
+  %0 = fir.alloca !fir.array<?xf32>, %arg0 {bindc_name = "a", uniq_name = "_QFvla_host_onlyEa"}
+  return
+}
+
+// HEAP-LABEL: func.func @marked_heap(
 // LLVM-LABEL: llvm.func @marked_heap(
 // LLVM: llvm.call @malloc_managed(
 // LLVM: llvm.call @free_managed(

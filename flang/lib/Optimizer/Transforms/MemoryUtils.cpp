@@ -17,6 +17,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Dominance.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallPtrSet.h"
 
 namespace {
 using DeallocationInsertionPoint = mlir::OpBuilder::InsertPoint;
@@ -349,6 +350,29 @@ static bool isDeviceCode(mlir::Operation *func, mlir::ModuleOp mod) {
   return false;
 }
 
+/// A local that device code reaches through a data clause is mapped and copied
+/// by the OpenACC runtime, so host memory is enough. `host_data use_device` and
+/// `deviceptr` hand out the host address itself, which only the unified or
+/// managed allocators make usable from the device.
+static bool isHostAddressGivenToDevice(fir::AllocaOp alloca) {
+  llvm::SmallVector<mlir::Value> worklist{alloca.getResult()};
+  llvm::SmallPtrSet<mlir::Operation *, 16> seen;
+  while (!worklist.empty()) {
+    mlir::Value value = worklist.pop_back_val();
+    for (mlir::Operation *user : value.getUsers()) {
+      if (!seen.insert(user).second)
+        continue;
+      if (mlir::isa<mlir::acc::UseDeviceOp, mlir::acc::DevicePtrOp>(user))
+        return true;
+      // Ops that only re-describe the same storage keep the address alive.
+      if (mlir::isa<fir::DeclareOp, fir::EmboxOp, fir::ReboxOp, fir::BoxAddrOp,
+                    fir::ConvertOp>(user))
+        worklist.append(user->result_begin(), user->result_end());
+    }
+  }
+  return false;
+}
+
 bool fir::promoteDynamicVariableAllocasToCudaHeap(mlir::RewriterBase &rewriter,
                                                   mlir::Operation *func,
                                                   bool stackArrays) {
@@ -379,7 +403,9 @@ bool fir::promoteDynamicVariableAllocasToCudaHeap(mlir::RewriterBase &rewriter,
       if (attr.getValue())
         return false;
     std::optional<llvm::StringRef> uniqName = alloca.getUniqName();
-    return uniqName && !uniqName->empty();
+    if (!uniqName || uniqName->empty())
+      return false;
+    return isHostAddressGivenToDevice(alloca);
   };
   auto genAllocmem = [&](mlir::OpBuilder &builder, fir::AllocaOp alloca,
                          bool) -> mlir::Value {
