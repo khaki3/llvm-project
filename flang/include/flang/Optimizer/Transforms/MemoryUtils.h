@@ -62,17 +62,15 @@ bool replaceAllocas(mlir::RewriterBase &rewriter, mlir::Operation *parentOp,
 fir::AllocMemOp createAllocMemFromAlloca(mlir::OpBuilder &builder,
                                          fir::AllocaOp alloca);
 
-/// Under -gpu=mem:unified|managed, move the dynamically sized fir.alloca of the
-/// user variables of \p func (automatic arrays and automatic character) to
-/// fir.allocmem/fir.freemem pairs marked for the unified/managed allocator.
-/// Compiler temporaries, fir.must_be_stack allocations, and device code, which
-/// keeps its stack allocations, are left alone. With \p stackArrays,
-/// mem:unified keeps them on the stack too, which mem:managed cannot do.
-/// Returns true if the function was modified. This is what the
-/// cuda-heap-alloc-promotion pass runs.
+/// Under -gpu=mem:managed, move the dynamically sized fir.alloca of the user
+/// variables of \p func (automatic arrays and automatic character) to
+/// fir.allocmem/fir.freemem pairs marked for the managed allocator. Compiler
+/// temporaries, fir.must_be_stack allocations, and device code, which keeps its
+/// stack allocations, are left alone. mem:unified is left alone as well, since
+/// the device reaches pageable memory there. Returns true if the function was
+/// modified. This is what the cuda-heap-alloc-promotion pass runs.
 bool promoteDynamicVariableAllocasToCudaHeap(mlir::RewriterBase &rewriter,
-                                             mlir::Operation *func,
-                                             bool stackArrays = false);
+                                             mlir::Operation *func);
 
 } // namespace fir
 

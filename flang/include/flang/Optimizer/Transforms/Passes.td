@@ -289,30 +289,25 @@ def SimplifyIntrinsics : Pass<"simplify-intrinsics", "mlir::ModuleOp"> {
 def CudaHeapAllocPromotion
     : Pass<"cuda-heap-alloc-promotion", "mlir::func::FuncOp"> {
   let summary = "Allocate dynamically sized automatic variables in CUDA "
-                "unified or managed memory.";
+                "managed memory.";
   let description = [{
-    Under -gpu=mem:unified|managed, which sets fir.cuda_heap_alloc on the
-    module, rewrite the dynamically sized fir.alloca of the user variables into
+    Under -gpu=mem:managed, which sets fir.cuda_heap_alloc on the module,
+    rewrite the dynamically sized fir.alloca of the user variables into
     fir.allocmem/fir.freemem pairs marked with that mode, so that codegen calls
-    the matching allocator entry points instead of libc malloc and free. The
-    host pointer of such a variable has to be device accessible, so this is a
-    correctness requirement of those modes rather than a placement heuristic:
-    the pass runs on its own instead of being part of whichever array
-    allocation pass the pipeline happens to select. The pairs it creates are
-    marked fir.must_be_heap, which keeps those passes from moving them back to
-    the stack. Without the module attribute the pass does nothing.
+    the managed allocator entry points instead of libc malloc and free. Only
+    what that allocator hands out is device accessible, so this is a
+    correctness requirement of the mode rather than a placement heuristic: the
+    pass runs on its own instead of being part of whichever array allocation
+    pass the pipeline happens to select. The pairs it creates are marked
+    fir.must_be_heap, which keeps those passes from moving them back to the
+    stack. Without the module attribute the pass does nothing.
 
-    Under mem:unified every host address is device accessible, including the
-    stack, so there the promotion is a placement choice that -fstack-arrays
-    opts out of. Under mem:managed only what the managed allocator hands out
-    is, so the promotion always happens.
+    mem:unified is left alone. It requires a platform on which the device
+    reaches pageable memory, so an automatic is device accessible wherever it
+    sits and moving it only costs: the OpenACC runtime skips the explicit copy
+    for a managed pointer, leaving the kernel to fault the pages in.
   }];
   let dependentDialects = ["fir::FIROpsDialect"];
-  let options = [
-    Option<"stackArrays", "stack-arrays", "bool", /*default=*/"false",
-           "Keep the automatic arrays of mem:unified on the stack, as "
-           "requested by -fstack-arrays.">
-  ];
 }
 
 def MemoryAllocationOpt : Pass<"memory-allocation-opt", "mlir::func::FuncOp"> {

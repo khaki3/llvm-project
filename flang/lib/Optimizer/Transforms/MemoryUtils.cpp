@@ -350,17 +350,19 @@ static bool isDeviceCode(mlir::Operation *func, mlir::ModuleOp mod) {
 }
 
 bool fir::promoteDynamicVariableAllocasToCudaHeap(mlir::RewriterBase &rewriter,
-                                                  mlir::Operation *func,
-                                                  bool stackArrays) {
+                                                  mlir::Operation *func) {
   auto mod = func->getParentOfType<mlir::ModuleOp>();
   if (!mod)
     return false;
   fir::CudaHeapAllocMode mode = fir::getCudaHeapAllocMode(mod);
   if (mode == fir::CudaHeapAllocMode::None || isDeviceCode(func, mod))
     return false;
-  // The stack is device accessible under unified memory, so -fstack-arrays can
-  // be honored there. Under managed memory only the allocator can be.
-  if (stackArrays && mode == fir::CudaHeapAllocMode::Unified)
+  // mem:unified requires a platform where the device reaches pageable memory,
+  // so an automatic is already device accessible wherever it sits and moving it
+  // only costs: the OpenACC runtime skips the explicit copy for a managed
+  // pointer, leaving the kernel to fault the pages in one by one. mem:managed
+  // gives that guarantee for allocator memory alone, so there it has to move.
+  if (mode != fir::CudaHeapAllocMode::Managed)
     return false;
 
   bool changed = false;

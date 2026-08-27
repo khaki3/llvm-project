@@ -198,11 +198,10 @@ void createDefaultFIRPreCFGOptimizerPassPipeline(
   pm.addPass(mlir::createCSEPass());
 
   // Unconditional and ahead of the array allocation placement below: under
-  // -gpu=mem:unified|managed the unified/managed allocators are required for
-  // correctness, so this must not depend on which placement pass is selected
-  // or on -disable-memory-allocation-opt.
-  pm.addPass(fir::createCudaHeapAllocPromotion(
-      fir::CudaHeapAllocPromotionOptions{pc.StackArrays}));
+  // -gpu=mem:managed the managed allocator is required for correctness, so this
+  // must not depend on which placement pass is selected or on
+  // -disable-memory-allocation-opt.
+  pm.addPass(fir::createCudaHeapAllocPromotion());
 
   if (enableAllocationPlacement)
     fir::addAllocationPlacement(pm, pc.StackArrays);

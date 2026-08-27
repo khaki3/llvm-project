@@ -32,8 +32,7 @@ public:
     if (func.empty())
       return;
     mlir::IRRewriter rewriter(&getContext());
-    fir::promoteDynamicVariableAllocasToCudaHeap(rewriter, func.getOperation(),
-                                                 stackArrays);
+    fir::promoteDynamicVariableAllocasToCudaHeap(rewriter, func.getOperation());
   }
 };
 } // namespace
