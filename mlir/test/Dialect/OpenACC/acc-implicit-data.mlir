@@ -46,6 +46,7 @@ func.func @test_scalar_in_kernels() {
 // CHECK: %[[COPYIN:.*]] = acc.copyin varPtr({{.*}} : memref<f64>) implicit(true) name("") -> memref<f64>
 // CHECK-NOT: acc.copyout
 // CHECK: acc.delete accPtr(%[[COPYIN]] : memref<f64>) dataClause(acc_copyin) implicit(true) name("")
+// CHECK-NOT: acc.copyout
 
 // -----
 

@@ -37,9 +37,11 @@ func.func @test_fir_scalar_in_kernels() {
   return
 }
 
+// CHECK-LABEL: func.func @test_fir_scalar_in_kernels()
 // CHECK: %[[COPYIN:.*]] = acc.copyin varPtr({{.*}} : !fir.ref<f64>) implicit(true) name("scalarvar") -> !fir.ref<f64>
 // CHECK-NOT: acc.copyout
 // CHECK: acc.delete accPtr(%[[COPYIN]] : !fir.ref<f64>) dataClause(acc_copyin) implicit(true) name("scalarvar")
+// CHECK-NOT: acc.copyout{{.*}}name("scalarvar")
 
 // -----
 
@@ -258,9 +260,11 @@ func.func @test_fir_scalar_in_kernels_defaultpresent() {
   return
 }
 
+// CHECK-LABEL: func.func @test_fir_scalar_in_kernels_defaultpresent()
 // CHECK: %[[COPYIN:.*]] = acc.copyin varPtr({{.*}} : !fir.ref<f64>) implicit(true) name("scalarvar") -> !fir.ref<f64>
 // CHECK-NOT: acc.copyout
 // CHECK: acc.delete accPtr(%[[COPYIN]] : !fir.ref<f64>) dataClause(acc_copyin) implicit(true) name("scalarvar")
+// CHECK-NOT: acc.copyout{{.*}}name("scalarvar")
 
 // -----
 
