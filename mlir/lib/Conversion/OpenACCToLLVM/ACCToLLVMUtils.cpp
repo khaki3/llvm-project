@@ -37,9 +37,9 @@ static Location unfuseLoopLoc(Location loc) {
   return loc;
 }
 
-Location acc::getDirectiveLoc(Location loc) {
-  // Fused sub-locations start with the base; acc.loop names its directive
-  // in the LoopLocAttr.
+Location acc::unfuseBaseLoc(Location loc) {
+  // Fused sub-locations start with the base; acc.loop additionally names that
+  // base -- its directive -- in the LoopLocAttr.
   while (auto fusedLoc = dyn_cast<FusedLoc>(loc)) {
     Location next = loc;
     auto loopLoc = dyn_cast_if_present<LoopLocAttr>(fusedLoc.getMetadata());
@@ -149,9 +149,9 @@ Value acc::createIdent(Location loc, StringRef functionName, OpBuilder &builder,
 
   std::string source;
   std::string sourceGlobalName;
-  Location directiveLoc = getDirectiveLoc(loc);
+  Location baseLoc = unfuseBaseLoc(loc);
   if (auto fileLineColLoc =
-          getFileLineColLoc(directiveLoc, /*errorOnInvalidLocation=*/false)) {
+          getFileLineColLoc(baseLoc, /*errorOnInvalidLocation=*/false)) {
     std::string filename = fileLineColLoc->getFilename().str();
     // The runtime reads the field up to the next ';', so the INCLUDE chain
     // rides along in the filename rather than needing a new ident field.

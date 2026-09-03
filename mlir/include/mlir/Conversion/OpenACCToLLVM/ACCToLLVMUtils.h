@@ -24,9 +24,12 @@ namespace acc {
 /// Unfuses fused locations, returning the last sub-location.
 Location unfuseLoc(Location loc);
 
-/// Returns the location of the directive a fused location was built for: the
-/// acc.loop directive when present, the base sub-location otherwise.
-Location getDirectiveLoc(Location loc);
+/// Peels fused locations down to the base sub-location. Both orderings this
+/// sees put the interesting entry first: flang writes an include chain as
+/// [base, inclusion...] and acc.loop writes [directive, loops...], the latter
+/// also naming its directive in the LoopLocAttr. Returns \p loc unchanged when
+/// it is not fused.
+Location unfuseBaseLoc(Location loc);
 
 /// Returns file:line:column location information when available.
 std::optional<FileLineColLoc> getFileLineColLoc(Location loc,
