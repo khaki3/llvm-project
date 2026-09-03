@@ -10,6 +10,7 @@
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/OpenACC/OpenACC.h"
 #include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/SmallString.h"
 
@@ -19,6 +20,38 @@ using namespace mlir::acc;
 Location acc::unfuseLoc(Location loc) {
   while (auto fusedLoc = dyn_cast<FusedLoc>(loc))
     loc = fusedLoc.getLocations().back();
+  return loc;
+}
+
+/// Peels the acc.loop layer, exposing the [base, inclusion...] chain beneath.
+static Location unfuseLoopLoc(Location loc) {
+  while (auto fusedLoc = dyn_cast<FusedLoc>(loc)) {
+    auto loopLoc = dyn_cast_if_present<LoopLocAttr>(fusedLoc.getMetadata());
+    if (!loopLoc || fusedLoc.getLocations().empty())
+      break;
+    loc = loopLoc.getDirective() &&
+                  !isa<UnknownLoc>(Location(loopLoc.getDirective()))
+              ? Location(loopLoc.getDirective())
+              : fusedLoc.getLocations().front();
+  }
+  return loc;
+}
+
+Location acc::getDirectiveLoc(Location loc) {
+  // Fused sub-locations start with the base; acc.loop names its directive
+  // in the LoopLocAttr.
+  while (auto fusedLoc = dyn_cast<FusedLoc>(loc)) {
+    Location next = loc;
+    auto loopLoc = dyn_cast_if_present<LoopLocAttr>(fusedLoc.getMetadata());
+    if (loopLoc && loopLoc.getDirective() &&
+        !isa<UnknownLoc>(Location(loopLoc.getDirective())))
+      next = Location(loopLoc.getDirective());
+    else if (!fusedLoc.getLocations().empty())
+      next = fusedLoc.getLocations().front();
+    if (next == loc)
+      break;
+    loc = next;
+  }
   return loc;
 }
 
@@ -116,9 +149,18 @@ Value acc::createIdent(Location loc, StringRef functionName, OpBuilder &builder,
 
   std::string source;
   std::string sourceGlobalName;
+  Location directiveLoc = getDirectiveLoc(loc);
   if (auto fileLineColLoc =
-          getFileLineColLoc(loc, /*errorOnInvalidLocation=*/false)) {
+          getFileLineColLoc(directiveLoc, /*errorOnInvalidLocation=*/false)) {
     std::string filename = fileLineColLoc->getFilename().str();
+    // The runtime reads the field up to the next ';', so the INCLUDE chain
+    // rides along in the filename rather than needing a new ident field.
+    if (auto fusedLoc = dyn_cast<FusedLoc>(unfuseLoopLoc(loc));
+        fusedLoc && fusedLoc.getMetadata())
+      for (Location inclusion : fusedLoc.getLocations().drop_front())
+        if (auto incLoc = getFileLineColLoc(inclusion, false))
+          filename += " (included from " + incLoc->getFilename().str() + ":" +
+                      std::to_string(incLoc->getLine()) + ")";
     std::string line = std::to_string(fileLineColLoc->getLine());
     std::string column = std::to_string(fileLineColLoc->getColumn());
     std::string functionDisplayName =

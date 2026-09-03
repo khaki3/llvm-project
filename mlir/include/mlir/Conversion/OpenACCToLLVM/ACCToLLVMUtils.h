@@ -24,6 +24,10 @@ namespace acc {
 /// Unfuses fused locations, returning the last sub-location.
 Location unfuseLoc(Location loc);
 
+/// Returns the location of the directive a fused location was built for: the
+/// acc.loop directive when present, the base sub-location otherwise.
+Location getDirectiveLoc(Location loc);
+
 /// Returns file:line:column location information when available.
 std::optional<FileLineColLoc> getFileLineColLoc(Location loc,
                                                 bool errorOnInvalidLocation);

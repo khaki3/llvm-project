@@ -142,3 +142,40 @@ module {
     return
   }
 }
+
+// -----
+
+// Fused location: report the base sub-location and name the INCLUDE site it
+// came from, rather than reporting the INCLUDE site itself. Flang tags the
+// chain with #fir<loc_kind_array[base, inclusion]>, which mlir-opt cannot
+// parse, so any metadata stands in for it here.
+
+// CHECK: llvm.mlir.global internal constant @loc_3_5_{{[0-9]+}}(";included.i90 (included from wait.mlir:42);test_wait_fused_loc;3;5;;\00")
+// CHECK-LABEL: llvm.func @test_wait_fused_loc
+
+#base = loc("included.i90":3:5)
+#includer = loc("wait.mlir":42:1)
+#fused = loc(fused<"loc_kind_array">[#base, #includer])
+module {
+  func.func @test_wait_fused_loc() {
+    acc.wait loc(#fused)
+    return
+  }
+}
+
+// -----
+
+// acc.loop fuses [directive, loops...]: report the directive, not the DO.
+
+// CHECK: llvm.mlir.global internal constant @loc_7_9_{{[0-9]+}}(";wait.mlir;test_wait_loop_loc;7;9;;\00")
+// CHECK-LABEL: llvm.func @test_wait_loop_loc
+
+#directive = loc("wait.mlir":7:9)
+#do_stmt = loc("wait.mlir":8:3)
+#loop = loc(fused<#acc.loop_loc<directive = #directive, loops = #do_stmt>>[#directive, #do_stmt])
+module {
+  func.func @test_wait_loop_loc() {
+    acc.wait loc(#loop)
+    return
+  }
+}
