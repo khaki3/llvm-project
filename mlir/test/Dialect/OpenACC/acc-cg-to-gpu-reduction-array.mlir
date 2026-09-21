@@ -453,3 +453,51 @@ func.func @thread_only_array_reduction_single_block() {
   } <{origin = "acc.parallel"}>
   return
 }
+
+// A thread-only array accumulate under a block launch is run whole by every
+// block, so the within-block all_reduce is already the complete reduction. It
+// is correct because the write-back names an active set with no block dim, so
+// a single block folds the result in.
+// CHECK-LABEL: func.func @thread_only_array_reduction_multi_block
+// CHECK: gpu.launch
+// CHECK-NOT: acc.reduction_accumulate_array
+// CHECK: scf.for %[[IV:.*]] = %{{.*}} to %{{.*}} step %{{.*}} {
+// CHECK:   %[[ELT:.*]] = memref.load %[[ALLOCA:.*]][%[[IV]]] : memref<8xi32>
+// CHECK:   %[[RED:.*]] = gpu.all_reduce add %[[ELT]]
+// CHECK:   memref.store %[[RED]], %[[ALLOCA]][%[[IV]]] : memref<8xi32>
+// CHECK: }
+func.func @thread_only_array_reduction_multi_block(%arg0: memref<8xi32>) {
+  %c4 = arith.constant 4 : index
+  %c128 = arith.constant 128 : index
+  %bx = acc.par_width %c4 par_dim(#acc.par_dim<block_x>)
+  %tx = acc.par_width %c128 par_dim(#acc.par_dim<thread_x>)
+  acc.compute_region launch(%kbx = %bx, %ktx = %tx) ins(%a0 = %arg0) : (memref<8xi32>) {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c8 = arith.constant 8 : index
+    %c0_i32 = arith.constant 0 : i32
+    %local = memref.alloca() : memref<8xi32>
+    scf.for %i = %c0 to %c8 step %c1 {
+      memref.store %c0_i32, %local[%i] : memref<8xi32>
+    }
+    scf.parallel (%t) = (%c0) to (%ktx) step (%c1) {
+      %v = memref.load %a0[%c0] : memref<8xi32>
+      %l = memref.load %local[%c0] : memref<8xi32>
+      %s = arith.addi %l, %v : i32
+      memref.store %s, %local[%c0] : memref<8xi32>
+      scf.reduce
+    } {acc.par_dims = #acc<par_dims[thread_x]>}
+    %bounds = acc.bounds extent(%c8 : index)
+    acc.reduction_accumulate_array %local bounds(%bounds) <add>
+        par_dims(#acc<par_dims[thread_x]>) : memref<8xi32>
+    acc.predicate_region {
+      scf.for %i = %c0 to %c8 step %c1 {
+        %se = memref.reinterpret_cast %local to offset: [%i], sizes: [], strides: [] : memref<8xi32> to memref<i32, strided<[], offset: ?>>
+        %de = memref.reinterpret_cast %a0 to offset: [%i], sizes: [], strides: [] : memref<8xi32> to memref<i32, strided<[], offset: ?>>
+        acc.reduction_combine %se into %de <add> par_dims(#acc<par_dims[thread_x]>) : memref<i32, strided<[], offset: ?>>
+      }
+    } {acc.active_par_dims = #acc<active_par_dims[]>}
+    acc.yield
+  } <{origin = "acc.parallel"}>
+  return
+}

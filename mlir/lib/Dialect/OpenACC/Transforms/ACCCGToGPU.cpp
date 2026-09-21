@@ -801,6 +801,47 @@ static acc::ReductionAccumulateArrayOp perThreadArrayReductionAccum(Value v) {
   return nullptr;
 }
 
+/// True when the element-wise write-back of \p accArr's temp is applied once
+/// per launch: its predicate region names an active set holding no block dim,
+/// so the block dims are predicated and a single block folds the result in.
+static bool
+arrayReductionWriteBackIsOncePerLaunch(acc::ReductionAccumulateArrayOp accArr) {
+  bool found = false;
+  SmallVector<Value> worklist{accArr.getMemref()};
+  DenseSet<Value> seen;
+  while (!worklist.empty()) {
+    Value cur = worklist.pop_back_val();
+    if (!seen.insert(cur).second)
+      continue;
+    for (Operation *user : cur.getUsers()) {
+      if (acc::ReductionCombineOp combine =
+              dyn_cast<acc::ReductionCombineOp>(user)) {
+        if (combine.getSrcMemref() != cur)
+          continue;
+        auto predicateRegion =
+            combine->getParentOfType<acc::PredicateRegionOp>();
+        if (!predicateRegion)
+          return false;
+        mlir::acc::ActiveParDimsAttr active =
+            getActiveParDimsAttr(predicateRegion);
+        if (!active || llvm::any_of(active.getArray(),
+                                    [](mlir::acc::GPUParallelDimAttr d) {
+                                      return d.isAnyBlock();
+                                    }))
+          return false;
+        found = true;
+        continue;
+      }
+      SmallVector<Value> through;
+      if (getPassThroughResults(user, cur, through))
+        worklist.append(through.begin(), through.end());
+      else if (isa<ViewLikeOpInterface>(user))
+        worklist.append(user->result_begin(), user->result_end());
+    }
+  }
+  return found;
+}
+
 /// Store the reduction identity to every element of a freshly allocated
 /// per-thread array accumulator so all lanes start from identity (the original
 /// init loop may only run on one lane).
@@ -3771,11 +3812,16 @@ void ACCCGToGPULowering::processAccumulateArrayOp(
 
   // A thread-only accumulate merges with a within-block all_reduce, which is
   // complete only in one block: block context, or a launch with no block dim.
-  // Multi-block thread-only still grid-strides across blocks, so stays NYI.
+  // Under a block launch every block holds the whole result, so it is correct
+  // only when the write-back is marked to apply once per launch.
   bool regionLaunchesBlocks = llvm::any_of(
       computeRegion.getLaunchParDims(),
       [](mlir::acc::GPUParallelDimAttr d) { return d.isAnyBlock(); });
-  if (!reductionHasBlockContext(op) && regionLaunchesBlocks) {
+  // gpu.all_reduce takes only integer and float, so a complex element type
+  // has no per-element reduction to merge with.
+  if (!reductionHasBlockContext(op) && regionLaunchesBlocks &&
+      (isa<ComplexType>(memrefTy.getElementType()) ||
+       !arrayReductionWriteBackIsOncePerLaunch(op))) {
     (void)accSupport.emitNYI(
         loc, "reduction: thread-only array reduction accumulate");
     return;
