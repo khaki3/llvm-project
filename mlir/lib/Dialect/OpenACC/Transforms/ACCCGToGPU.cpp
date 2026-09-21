@@ -487,6 +487,12 @@ private:
   void processAccumulateOp(acc::ReductionAccumulateOp op);
   /// Lower `acc.reduction_accumulate_array`.
   void processAccumulateArrayOp(acc::ReductionAccumulateArrayOp op);
+
+  /// Make the in-place updates of a block-shared accumulator atomic. Returns
+  /// the ops left writing the accumulator, atomic or not.
+  SmallVector<Operation *>
+  atomicizeSharedAccumulatorUpdates(Value accum, arith::AtomicRMWKind kind,
+                                    ArrayRef<Value> threadIds);
   /// Lower `acc.reduction_init`.
   void processReductionOp(acc::ReductionInitOp op);
   /// Lower `acc.reduction_combine`.
@@ -501,9 +507,10 @@ private:
   void processOp(Operation *op);
 
   /// Emit an atomic reduction update to \p memref.
-  void constructAtomicAccumulation(Location loc, Value memref,
-                                   ValueRange indices, Value input,
-                                   arith::AtomicRMWKind kind);
+  /// Returns the created `acc.atomic.update`, or null when unsupported.
+  Operation *constructAtomicAccumulation(Location loc, Value memref,
+                                         ValueRange indices, Value input,
+                                         arith::AtomicRMWKind kind);
 
   /// Map an ACC reduction operator to an atomic RMW kind.
   FailureOr<arith::AtomicRMWKind> getReductionKind(acc::ReductionOperator redOp,
@@ -3319,11 +3326,27 @@ getAllReduceOperation(arith::AtomicRMWKind kind) {
   llvm_unreachable("unsupported atomic kind");
 }
 
-void ACCCGToGPULowering::constructAtomicAccumulation(
-    Location loc, Value memref, ValueRange indices, Value input,
-    arith::AtomicRMWKind kind) {
+Operation *
+ACCCGToGPULowering::constructAtomicAccumulation(Location loc, Value memref,
+                                                ValueRange indices, Value input,
+                                                arith::AtomicRMWKind kind) {
   assert(!memref.getDefiningOp<memref::AllocaOp>() &&
          "cannot lower atomic accumulation on an stack variable");
+
+  // A complex update is atomic either componentwise, which needs an additive
+  // operator, or by compare-exchanging the packed value, which the target can
+  // only do up to 64 bits. min/max reach here for complex as well and have no
+  // complex form at all.
+  if (auto complexTy = dyn_cast<ComplexType>(input.getType())) {
+    bool componentwise = kind == arith::AtomicRMWKind::addf;
+    bool packed = kind == arith::AtomicRMWKind::mulf &&
+                  2 * complexTy.getElementType().getIntOrFloatBitWidth() <= 64;
+    if (!componentwise && !packed) {
+      (void)accSupport.emitNYI(
+          loc, "reduction: unsupported complex reduction operator");
+      return nullptr;
+    }
+  }
 
   // acc.atomic.update derives the element address from the memref descriptor's
   // base pointer and offset field; it has no subscript operand. When the store
@@ -3351,10 +3374,26 @@ void ACCCGToGPULowering::constructAtomicAccumulation(
   Block *block =
       rewriter.createBlock(&region, region.begin(), {input.getType()}, {loc});
   rewriter.setInsertionPointToStart(block);
-  Value reductionExpr =
-      generateReductionOp(rewriter, loc, input, block->getArgument(0), kind);
+  Value cur = block->getArgument(0);
+  Value reductionExpr;
+  // Update the real and imaginary parts separately so the atomic lowering can
+  // match them into per-component atomicrmw; a whole-complex update falls back
+  // to a compare-exchange loop on the packed value.
+  auto complexTy = dyn_cast<ComplexType>(input.getType());
+  if (complexTy && kind == arith::AtomicRMWKind::addf) {
+    Value re = arith::AddFOp::create(
+        rewriter, loc, complex::ReOp::create(rewriter, loc, cur),
+        complex::ReOp::create(rewriter, loc, input));
+    Value im = arith::AddFOp::create(
+        rewriter, loc, complex::ImOp::create(rewriter, loc, cur),
+        complex::ImOp::create(rewriter, loc, input));
+    reductionExpr = complex::CreateOp::create(rewriter, loc, complexTy, re, im);
+  } else {
+    reductionExpr = generateReductionOp(rewriter, loc, input, cur, kind);
+  }
   acc::YieldOp::create(rewriter, loc, reductionExpr);
   rewriter.setInsertionPointAfter(atomicUpdateOp);
+  return atomicUpdateOp;
 }
 
 void ACCCGToGPULowering::createGPUAllReduceOp(
@@ -3363,8 +3402,28 @@ void ACCCGToGPULowering::createGPUAllReduceOp(
     bool isPerThreadPrivateTarget) {
   gpu::AllReduceOperationAttr attr = gpu::AllReduceOperationAttr::get(
       computeRegion->getContext(), getAllReduceOperation(kind));
-  auto allReduceOp = gpu::AllReduceOp::create(rewriter, loc, input, attr, true);
-  mlir::acc::setParDimsAttr(allReduceOp, parDimsAttr);
+  // gpu.all_reduce takes no complex operand, so reduce the real and imaginary
+  // parts separately.
+  Value reduced;
+  auto emitAllReduce = [&](Value v) {
+    auto op = gpu::AllReduceOp::create(rewriter, loc, v, attr, true);
+    mlir::acc::setParDimsAttr(op, parDimsAttr);
+    return op.getResult();
+  };
+  if (auto complexTy = dyn_cast<ComplexType>(input.getType())) {
+    // Only a componentwise operator may be split this way. Complex multiply
+    // is not, and the min/max kinds reach here for complex too.
+    if (kind != arith::AtomicRMWKind::addf) {
+      (void)accSupport.emitNYI(
+          loc, "reduction: non-additive complex reduction across threads");
+      return;
+    }
+    Value re = emitAllReduce(complex::ReOp::create(rewriter, loc, input));
+    Value im = emitAllReduce(complex::ImOp::create(rewriter, loc, input));
+    reduced = complex::CreateOp::create(rewriter, loc, complexTy, re, im);
+  } else {
+    reduced = emitAllReduce(input);
+  }
   // Predicate the store on the thread-level dimensions being reduced so that
   // only one thread per reduced group writes the result. Only dimensions in
   // parDimsAttr are included; sweeping over all dimensions between the highest
@@ -3408,13 +3467,13 @@ void ACCCGToGPULowering::createGPUAllReduceOp(
     Block &thenBlock = thenRegion.back();
     rewriter.setInsertionPoint(thenBlock.getTerminator());
   }
-  memref::StoreOp::create(rewriter, loc, allReduceOp, memref, indices);
+  memref::StoreOp::create(rewriter, loc, reduced, memref, indices);
   if (predicate && !isPerThreadPrivate)
     rewriter.setInsertionPointAfter(ifOp);
   // A later block combine reuses this instead of reloading the slot. This only
   // applies to scalar accumulators; array elements are indexed individually.
   if (indices.empty())
-    reductionAccumValue[memref] = allReduceOp;
+    reductionAccumValue[memref] = reduced;
 }
 
 void ACCCGToGPULowering::postprocessAccumulateOp(
@@ -3687,11 +3746,10 @@ static Value matchAccumulatorUpdate(memref::StoreOp store, Value accum) {
 /// A block-shared accumulator is updated in place by the loop body, so several
 /// threads may hit the same element. Make those updates atomic unless the
 /// element index provably varies across the participating threads.
-static void atomicizeSharedAccumulatorUpdates(Value accum,
-                                              arith::AtomicRMWKind kind,
-                                              ArrayRef<Value> threadIds,
-                                              RewriterBase &rewriter) {
+SmallVector<Operation *> ACCCGToGPULowering::atomicizeSharedAccumulatorUpdates(
+    Value accum, arith::AtomicRMWKind kind, ArrayRef<Value> threadIds) {
   OpBuilder::InsertionGuard guard(rewriter);
+  SmallVector<Operation *> writes;
   SmallVector<memref::StoreOp> stores;
   SmallVector<Value> worklist{accum};
   DenseSet<Value> seen;
@@ -3709,23 +3767,97 @@ static void atomicizeSharedAccumulatorUpdates(Value accum,
 
   for (memref::StoreOp store : stores) {
     Value contribution = matchAccumulatorUpdate(store, accum);
-    if (!contribution)
+    if (!contribution) {
+      writes.push_back(store);
       continue;
+    }
     // A thread-varying index means each thread owns its element, so the
     // existing plain update is already race-free.
     if (llvm::any_of(store.getIndices(), [&](Value idx) {
           DenseSet<Value> visited;
           return isThreadVarying(idx, threadIds, visited);
-        }))
+        })) {
+      writes.push_back(store);
       continue;
+    }
     Operation *combine = store.getValueToStore().getDefiningOp();
     rewriter.setInsertionPoint(store);
-    memref::AtomicRMWOp::create(rewriter, store.getLoc(), kind, contribution,
-                                store.getMemRef(), store.getIndices());
+    // memref.atomic_rmw has no complex form; acc.atomic.update carries the
+    // combine instead. An alloca root is thread-private, so an atomic on it
+    // would reduce nothing.
+    if (isa<ComplexType>(contribution.getType())) {
+      if (isa_and_nonnull<memref::AllocaOp>(
+              unwrapMemRefConversion(accum).getDefiningOp())) {
+        (void)accSupport.emitNYI(
+            store.getLoc(),
+            "reduction: complex array reduction on thread-private storage");
+        writes.push_back(store);
+        continue;
+      }
+      if (Operation *atomicOp = constructAtomicAccumulation(
+              store.getLoc(), store.getMemRef(), store.getIndices(),
+              contribution, kind))
+        writes.push_back(atomicOp);
+    } else {
+      writes.push_back(memref::AtomicRMWOp::create(
+          rewriter, store.getLoc(), kind, contribution, store.getMemRef(),
+          store.getIndices()));
+    }
     rewriter.eraseOp(store);
     if (combine && combine->use_empty())
       rewriter.eraseOp(combine);
   }
+  return writes;
+}
+
+/// The statement of \p block containing \p op, or null if \p op is outside it.
+static Operation *statementIn(Operation *op, Block *block) {
+  while (op && op->getBlock() != block)
+    op = op->getParentOp();
+  return op;
+}
+
+/// The innermost block enclosing both \p op and \p block.
+static Block *nearestCommonBlock(Operation *op, Block *block) {
+  for (Block *b = block; b;) {
+    if (statementIn(op, b))
+      return b;
+    Operation *parent = b->getParentOp();
+    b = parent ? parent->getBlock() : nullptr;
+  }
+  return nullptr;
+}
+
+/// The last of \p writes to run, as a statement of the innermost block it
+/// shares with \p ip. Stopping at that block keeps the anchor inside an
+/// enclosing loop that also holds the reader, instead of hoisting past it.
+/// Writes sharing no block with \p ip are leftovers in the region being
+/// lowered from - they are not in the final IR, so anchoring to one loses
+/// whatever is placed after it.
+static Operation *lastWriteNear(ArrayRef<Operation *> writes, Block *ip) {
+  Operation *last = nullptr;
+  Block *anchorBlock = nullptr;
+  for (Operation *w : writes) {
+    if (!w || !ip)
+      continue;
+    Block *common = nearestCommonBlock(w, ip);
+    Operation *stmt = common ? statementIn(w, common) : nullptr;
+    if (!stmt)
+      continue;
+    // Prefer the block closest to the insertion point; among writes in it,
+    // the one that runs last.
+    if (anchorBlock && common != anchorBlock) {
+      // Keep the block closest to the insertion point; a shallower one is a
+      // leftover reached through the region being lowered from.
+      if (!anchorBlock->getParent()->isProperAncestor(common->getParent()))
+        continue;
+      last = nullptr;
+    }
+    anchorBlock = common;
+    if (!last || last->isBeforeInBlock(stmt))
+      last = stmt;
+  }
+  return last;
 }
 
 void ACCCGToGPULowering::processAccumulateArrayOp(
@@ -3829,8 +3961,24 @@ void ACCCGToGPULowering::processAccumulateArrayOp(
       threadIds.push_back(yId);
     if (Value zId = getGPUThreadIdFor(gpu::Processor::ThreadZ))
       threadIds.push_back(zId);
-    atomicizeSharedAccumulatorUpdates(accumulatorRoot(memref), kind, threadIds,
-                                      rewriter);
+    SmallVector<Operation *> writes = atomicizeSharedAccumulatorUpdates(
+        accumulatorRoot(memref), kind, threadIds);
+    // The combine reads the whole block partial, so every thread's update must
+    // have landed first - including the plain stores left alone above, whose
+    // element is owned by a single thread but is read by all of them.
+    //
+    // Anchor the barrier to the updates rather than to wherever this op is
+    // being lowered from: a nested accumulate is lowered with the insertion
+    // point at the end of the kernel body, which is past the combine. The last
+    // update, taken as a statement of the kernel body, is after every update,
+    // before the combine, and outside any predicate - a workgroup barrier
+    // reached by the one thread that enters a predicate deadlocks.
+    if (Operation *anchor =
+            lastWriteNear(writes, rewriter.getInsertionBlock())) {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointAfter(anchor);
+      gpu::BarrierOp::create(rewriter, loc);
+    }
     eraseDeadBounds();
     return;
   }
