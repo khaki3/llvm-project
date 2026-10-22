@@ -516,8 +516,7 @@ private:
   void processOp(Operation *op);
 
   /// Emit an atomic reduction update to \p memref.
-  void constructAtomicAccumulation(Location loc, Value memref,
-                                   ValueRange indices, Value input,
+  void constructAtomicAccumulation(Location loc, Value memref, Value input,
                                    arith::AtomicRMWKind kind);
 
   /// Map an ACC reduction operator to an atomic RMW kind.
@@ -2455,15 +2454,7 @@ void ACCCGToGPULowering::processPredicateRegion(
     }
   }
 
-  Value predicate = emitPredicate(loc, parDimsPair.second);
-  // With one thread per block nothing is predicated, but a block-level
-  // reduction store below must still become a cross-block atomic.
-  if (!predicate && llvm::all_of(computeRegion.getLaunchParDims(),
-                                 [](mlir::acc::GPUParallelDimAttr pd) {
-                                   return pd.isAnyBlock();
-                                 }))
-    predicate = arith::ConstantIntOp::create(rewriter, loc, 1, 1);
-  if (predicate) {
+  if (Value predicate = emitPredicate(loc, parDimsPair.second)) {
     LLVM_DEBUG(llvm::dbgs() << "predicate: " << predicate << "\n");
     bool isInsideThreadXLoop = false;
     bool isInsideThreadYLoop = false;
@@ -2523,191 +2514,8 @@ void ACCCGToGPULowering::processPredicateRegion(
     Block &thenBlock = thenRegion.back();
     rewriter.setInsertionPoint(thenBlock.getTerminator());
     // Ops in a predicate region may need to be further processed, recurse
-    for (auto &bodyOp : interOp.getRegion().front().getOperations()) {
-      // If the store's value loads from a block-level reduction
-      // memref, convert to atomic for cross-block correctness.
-      // Only at kernel top level (no active thread dims).
-      if (memref::StoreOp storeOp = dyn_cast<memref::StoreOp>(&bodyOp)) {
-        std::optional<arith::AtomicRMWKind> blockReduceKind;
-        bool failedReductionKind = false;
-        Value storeVal = storeOp.getValueToStore();
-        if (storeVal.getDefiningOp()) {
-          // Walk the epilogue def-chain within the enclosing block to find
-          // the block-level accumulate load feeding this store.  Epilogue ops
-          // (type conversions, arithmetic, etc.) are traversed transparently.
-          // Non-acc loads and values defined outside the block are treated as
-          // loop-invariant and return nullopt, bounding the search naturally.
-          Block *epilogueBlock = interOp->getBlock();
-          auto findBlockAccLoad =
-              [&](auto &self,
-                  Value val) -> std::optional<arith::AtomicRMWKind> {
-            Operation *def = val.getDefiningOp();
-            if (!def || def->getBlock() != epilogueBlock)
-              return std::nullopt;
-            if (memref::LoadOp loadOp = dyn_cast<memref::LoadOp>(def)) {
-              for (auto *user : loadOp.getMemRef().getUsers()) {
-                if (acc::ReductionAccumulateOp accOp =
-                        dyn_cast<acc::ReductionAccumulateOp>(user)) {
-                  if (llvm::any_of(accOp.getParDims().getArray(),
-                                   [](mlir::acc::GPUParallelDimAttr pd) {
-                                     return pd.isAnyBlock();
-                                   })) {
-                    FailureOr<arith::AtomicRMWKind> kind = getReductionKind(
-                        accOp.getReductionOperator(),
-                        accOp.getValue().getType(), accOp.getLoc());
-                    if (failed(kind)) {
-                      failedReductionKind = true;
-                      return std::nullopt;
-                    }
-                    return *kind;
-                  }
-                }
-              }
-              return std::nullopt;
-            }
-            for (Value operand : def->getOperands())
-              if (auto kind = self(self, operand))
-                return kind;
-            return std::nullopt;
-          };
-          blockReduceKind = findBlockAccLoad(findBlockAccLoad, storeVal);
-        }
-        if (failedReductionKind)
-          return;
-        if (blockReduceKind) {
-          Value input = mapping.lookupOrDefault(storeOp.getValueToStore());
-          Value memref = mapping.lookupOrDefault(storeOp.getMemref());
-          bool threadIsActive = llvm::any_of(
-              parDimsPair.first, [](mlir::acc::GPUParallelDimAttr pd) {
-                return !pd.isAnyBlock();
-              });
-          if (!threadIsActive &&
-              !isa_and_nonnull<memref::AllocaOp>(
-                  unwrapMemRefConversion(memref).getDefiningOp())) {
-            // Initialize the destination to the reduction identity before
-            // cross-block atomics so that the final result reflects pure
-            // assignment semantics (e.g. r = sum(a)), not accumulation
-            // on top of the pre-kernel value.
-            if (launch) {
-              MemRefType memrefTy = cast<MemRefType>(memref.getType());
-              // Map the store indices for ranked memrefs.
-              SmallVector<Value> initIndices;
-              for (Value idx : storeOp.getIndices())
-                initIndices.push_back(mapping.lookupOrDefault(idx));
-
-              OpBuilder::InsertionGuard guard(rewriter);
-              Block &launchBody = launch.getBody().front();
-              Operation *insertBefore = nullptr;
-
-              launchBody.walk([&](scf::ParallelOp parOp) -> WalkResult {
-                for (Operation *parent = parOp->getParentOp(); parent;
-                     parent = parent->getParentOp()) {
-                  if (parent == launch.getOperation())
-                    break;
-                  if (isa<scf::ParallelOp>(parent))
-                    return WalkResult::advance();
-                }
-                insertBefore = parOp.getOperation();
-                return WalkResult::interrupt();
-              });
-              // The identity must be ordered before the atomics of every
-              // block, so store it from a launch ahead of this one when the
-              // address does not depend on the launch.
-              std::function<bool(Value)> fromLaunch = [&](Value v) -> bool {
-                if (auto arg = dyn_cast<BlockArgument>(v))
-                  return launch->isAncestor(arg.getOwner()->getParentOp());
-                Operation *def = v.getDefiningOp();
-                if (!launch->isAncestor(def) ||
-                    def->hasTrait<OpTrait::ConstantLike>())
-                  return false;
-                // Ids and dims such as gpu.grid_dim take no operands.
-                return def->getNumOperands() == 0 ||
-                       llvm::any_of(def->getOperands(), fromLaunch);
-              };
-              if (!fromLaunch(memref) &&
-                  llvm::none_of(initIndices, fromLaunch)) {
-                rewriter.setInsertionPoint(launch);
-                Value one = arith::ConstantIndexOp::create(rewriter, loc, 1);
-                Value token = launch.getAsyncToken();
-                auto initLaunch = gpu::LaunchOp::create(
-                    rewriter, loc, one, one, one, one, one, one,
-                    /*dynamicSharedMemorySize=*/nullptr,
-                    token ? token.getType() : Type(),
-                    launch.getAsyncDependencies());
-                rewriter.setInsertionPointToStart(
-                    &initLaunch.getBody().front());
-                rewriter.setInsertionPoint(
-                    gpu::TerminatorOp::create(rewriter, loc));
-              } else if (insertBefore)
-                rewriter.setInsertionPoint(insertBefore);
-              else
-                rewriter.setInsertionPointToStart(&launchBody);
-              // Recursively re-materialize operations whose definitions
-              // do not dominate the insertion point.  A single-level clone
-              // is insufficient when the value is produced by a chain of
-              // operations (e.g. reinterpret_cast depending on box_dims,
-              // divsi, convert, etc.) that are all defined after the
-              // insertion point.
-              DominanceInfo domInfo(launch);
-              IRMapping initMapping;
-              std::function<Value(Value)> materialize =
-                  [&](Value val) -> Value {
-                Operation *defOp = val.getDefiningOp();
-                if (!defOp)
-                  return val;
-                if (domInfo.dominates(defOp, &*rewriter.getInsertionPoint()))
-                  return val;
-                if (auto mapped = initMapping.lookupOrNull(val))
-                  return mapped;
-                // Recurse on operands; the recursive call seeds
-                // initMapping for any operand it clones, which the
-                // subsequent rewriter.clone(..., initMapping) picks up.
-                for (Value operand : defOp->getOperands())
-                  materialize(operand);
-                Operation *cloned = rewriter.clone(*defOp, initMapping);
-                for (auto [orig, clonedRes] :
-                     llvm::zip(defOp->getResults(), cloned->getResults())) {
-                  initMapping.map(orig, clonedRes);
-                }
-                return initMapping.lookup(val);
-              };
-              Value initMemref = materialize(memref);
-              for (auto &idx : initIndices)
-                idx = materialize(idx);
-              Value identityVal = createIdentityValue(
-                  rewriter, loc, memrefTy.getElementType(), *blockReduceKind,
-                  /*useOnlyFiniteValue=*/true);
-              Value blockId = gpu::BlockIdOp::create(
-                  rewriter, loc, rewriter.getIndexType(), gpu::Dimension::x);
-              Value threadId = gpu::ThreadIdOp::create(
-                  rewriter, loc, rewriter.getIndexType(), gpu::Dimension::x);
-              Value zero = arith::ConstantIndexOp::create(rewriter, loc, 0);
-              Value isBlock0 = arith::CmpIOp::create(
-                  rewriter, loc, arith::CmpIPredicate::eq, blockId, zero);
-              Value isThread0 = arith::CmpIOp::create(
-                  rewriter, loc, arith::CmpIPredicate::eq, threadId, zero);
-              Value isFirstThread =
-                  arith::AndIOp::create(rewriter, loc, isBlock0, isThread0);
-              auto initIf = scf::IfOp::create(rewriter, loc, isFirstThread,
-                                              /*withElseRegion=*/false);
-              rewriter.setInsertionPoint(
-                  initIf.getThenRegion().back().getTerminator());
-              memref::StoreOp::create(rewriter, loc, identityVal, initMemref,
-                                      initIndices);
-              rewriter.setInsertionPointAfter(initIf);
-              gpu::BarrierOp::create(rewriter, loc);
-            }
-            SmallVector<Value> atomicIndices;
-            for (Value idx : storeOp.getIndices())
-              atomicIndices.push_back(mapping.lookupOrDefault(idx));
-            constructAtomicAccumulation(loc, memref, atomicIndices, input,
-                                        *blockReduceKind);
-            continue;
-          }
-        }
-      }
+    for (auto &bodyOp : interOp.getRegion().front().getOperations())
       processOp(&bodyOp);
-    }
     rewriter.setInsertionPointAfter(ifOp);
     emitReconvergenceBarrier();
   } else {
@@ -3525,33 +3333,12 @@ getAllReduceOperation(arith::AtomicRMWKind kind) {
 }
 
 void ACCCGToGPULowering::constructAtomicAccumulation(
-    Location loc, Value memref, ValueRange indices, Value input,
-    arith::AtomicRMWKind kind) {
+    Location loc, Value memref, Value input, arith::AtomicRMWKind kind) {
   assert(!memref.getDefiningOp<memref::AllocaOp>() &&
          "cannot lower atomic accumulation on an stack variable");
 
-  // acc.atomic.update derives the element address from the memref descriptor's
-  // base pointer and offset field; it has no subscript operand. When the store
-  // being lowered targets a specific array element (e.g. result(idx) =
-  // max(...)), fold the indices into the descriptor offset with a subview so
-  // the atomic updates the intended element. Otherwise the atomic always hits
-  // element 0, so any reduction whose destination index is non-zero is
-  // miscompiled (the result lands in element 0 while the intended element keeps
-  // its identity-init value).
-  Value target = memref;
-  if (!indices.empty()) {
-    MemRefType memrefTy = cast<MemRefType>(memref.getType());
-    unsigned rank = memrefTy.getRank();
-    assert(indices.size() == rank && "expected one index per memref dimension");
-    SmallVector<OpFoldResult> offsets(indices.begin(), indices.end());
-    SmallVector<OpFoldResult> sizes(rank, rewriter.getIndexAttr(1));
-    SmallVector<OpFoldResult> strides(rank, rewriter.getIndexAttr(1));
-    target = memref::SubViewOp::create(rewriter, loc, memref, offsets, sizes,
-                                       strides);
-  }
-
   auto atomicUpdateOp =
-      acc::AtomicUpdateOp::create(rewriter, loc, target, /*ifCond=*/Value());
+      acc::AtomicUpdateOp::create(rewriter, loc, memref, /*ifCond=*/Value());
   Region &region = atomicUpdateOp->getRegion(0);
   Block *block =
       rewriter.createBlock(&region, region.begin(), {input.getType()}, {loc});
@@ -4189,8 +3976,7 @@ void ACCCGToGPULowering::processReductionCombineOp(acc::ReductionCombineOp op) {
       auto srcLoad =
           memref::LoadOp::create(rewriter, loc, srcMemref, ValueRange{});
       pendingCombineReloads.push_back({srcMemref, srcLoad});
-      constructAtomicAccumulation(loc, destMemref, /*indices=*/{}, srcLoad,
-                                  kind);
+      constructAtomicAccumulation(loc, destMemref, srcLoad, kind);
       return;
     }
   }
@@ -4237,7 +4023,7 @@ void ACCCGToGPULowering::processCombineRegionOp(
           pendingCombineReloads.push_back({srcMemref, reductionLoad});
           constructAtomicAccumulation(loc,
                                       mapping.lookupOrDefault(op.getDestVar()),
-                                      /*indices=*/{}, reductionLoad, *kind);
+                                      reductionLoad, *kind);
           return;
         }
       }
@@ -4257,7 +4043,7 @@ void ACCCGToGPULowering::processCombineRegionOp(
         });
         constructAtomicAccumulation(loc,
                                     mapping.lookupOrDefault(op.getDestVar()),
-                                    /*indices=*/{}, reductionResult, kind);
+                                    reductionResult, kind);
         return;
       }
     }

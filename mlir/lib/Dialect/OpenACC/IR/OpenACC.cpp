@@ -576,6 +576,27 @@ static void printAccVar(mlir::OpAsmPrinter &p, mlir::Operation *op,
   p << ")";
 }
 
+/// The second operand type of a reduction combine is printed only when it
+/// differs from the first.
+static ParseResult parseCombineTypes(mlir::OpAsmParser &parser,
+                                     mlir::Type &type, mlir::Type &otherType) {
+  if (failed(parser.parseType(type)))
+    return failure();
+  otherType = type;
+  if (succeeded(parser.parseOptionalComma()))
+    return parser.parseType(otherType);
+  return success();
+}
+
+static void printCombineTypes(mlir::OpAsmPrinter &p, mlir::Operation *op,
+                              mlir::Type type, mlir::Type otherType) {
+  p.printType(type);
+  if (otherType != type) {
+    p << ", ";
+    p.printType(otherType);
+  }
+}
+
 static ParseResult parseVarPtrType(mlir::OpAsmParser &parser,
                                    mlir::Type &varPtrType,
                                    mlir::TypeAttr &varTypeAttr) {

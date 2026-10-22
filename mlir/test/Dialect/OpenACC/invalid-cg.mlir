@@ -204,3 +204,45 @@ func.func @nested_kernel_environment() {
   }
   return
 }
+
+// -----
+
+func.func @reduction_combine_element_type_mismatch(%private: memref<f64>, %shared: memref<f32>) {
+  // expected-error@+1 {{'acc.reduction_combine' op failed to verify that all of {destMemref, srcMemref} have same element type}}
+  acc.reduction_combine %private into %shared <add> : memref<f32>, memref<f64>
+  return
+}
+
+// -----
+
+func.func @reduction_combine_shape_mismatch(%private: memref<f32>, %shared: memref<4xf32>) {
+  // expected-error@+1 {{'acc.reduction_combine' op destination and source must have the same shape}}
+  acc.reduction_combine %private into %shared <add> : memref<4xf32>, memref<f32>
+  return
+}
+
+// -----
+
+func.func @reduction_combine_memory_space_mismatch(%private: memref<f32>, %shared: memref<f32, 1>) {
+  // expected-error@+1 {{'acc.reduction_combine' op destination and source must be in the same memory space}}
+  acc.reduction_combine %private into %shared <add> : memref<f32, 1>, memref<f32>
+  return
+}
+
+// -----
+
+func.func @reduction_combine_unranked(%private: memref<i32>, %shared: memref<*xi32>) {
+  // expected-error@+1 {{'acc.reduction_combine' op destination and source of different types must be ranked memrefs}}
+  acc.reduction_combine %private into %shared <add> : memref<*xi32>, memref<i32>
+  return
+}
+
+// -----
+
+func.func @reduction_combine_region_shape_mismatch(%private: memref<f32>, %shared: memref<4xf32>) {
+  // expected-error@+1 {{'acc.reduction_combine_region' op destination and source must have the same shape}}
+  acc.reduction_combine_region %private into %shared : memref<f32>, memref<4xf32> {
+    acc.yield
+  }
+  return
+}

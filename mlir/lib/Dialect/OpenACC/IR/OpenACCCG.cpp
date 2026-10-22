@@ -581,7 +581,27 @@ ReductionCombineRegionOp::getSuccessorInputs(RegionSuccessor successor) {
   return getSingleRegionSuccessorInputs(getOperation(), successor);
 }
 
+/// The operands of a combine may differ in the layout of ranked memrefs only.
+static LogicalResult verifyCombineShapes(Operation *op, Type dest, Type src) {
+  if (dest == src)
+    return success();
+  auto destMemRef = dyn_cast<MemRefType>(dest);
+  auto srcMemRef = dyn_cast<MemRefType>(src);
+  if (!destMemRef || !srcMemRef)
+    return op->emitOpError(
+        "destination and source of different types must be ranked memrefs");
+  if (destMemRef.getShape() != srcMemRef.getShape())
+    return op->emitOpError("destination and source must have the same shape");
+  if (destMemRef.getMemorySpace() != srcMemRef.getMemorySpace())
+    return op->emitOpError(
+        "destination and source must be in the same memory space");
+  return success();
+}
+
 LogicalResult ReductionCombineRegionOp::verify() {
+  if (failed(verifyCombineShapes(*this, getDestVar().getType(),
+                                 getSrcVar().getType())))
+    return failure();
   Block &block = getRegion().front();
   if (auto yieldOp = dyn_cast<acc::YieldOp>(block.getTerminator())) {
     if (yieldOp.getNumOperands() != 0)
@@ -621,6 +641,11 @@ LogicalResult ReductionAccumulateArrayOp::verify() {
 //===----------------------------------------------------------------------===//
 // ReductionCombineOp
 //===----------------------------------------------------------------------===//
+
+LogicalResult ReductionCombineOp::verify() {
+  return verifyCombineShapes(*this, getDestMemref().getType(),
+                             getSrcMemref().getType());
+}
 
 void ReductionCombineOp::getEffects(
     SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>

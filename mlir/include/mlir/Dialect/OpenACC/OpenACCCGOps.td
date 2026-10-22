@@ -78,7 +78,8 @@ def OpenACC_ReductionInitOp
 
 def OpenACC_ReductionCombineRegionOp
     : OpenACC_Op<"reduction_combine_region",
-                 [SameTypeOperands, RecursiveMemoryEffects,
+                 [AllElementTypesMatch<["destVar", "srcVar"]>,
+                  RecursiveMemoryEffects,
                   DeclareOpInterfaceMethods<RegionBranchOpInterface,
                                             ["getRegionInvocationBounds",
                                              "getSuccessorInputs"]>,
@@ -93,14 +94,17 @@ def OpenACC_ReductionCombineRegionOp
 
     The `destVar` operand is the original/shared reduction variable.
     The `srcVar` operand is typically the result of acc.reduction_init.
+    As for `acc.reduction_combine`, the destination may be a view with a
+    different layout, and its type is then printed after the source type.
   }];
   let arguments = (ins OpenACC_AnyPointerOrMappableType:$destVar,
                        OpenACC_AnyPointerOrMappableType:$srcVar);
   let results = (outs);
   let regions = (region AnyRegion:$region);
   let assemblyFormat = [{
-    $srcVar `into` $destVar `:` type($srcVar) $region
-    attr-dict
+    $srcVar `into` $destVar `:` custom<CombineTypes>(type($srcVar),
+                                                       type($destVar))
+    $region attr-dict
   }];
   let hasVerifier = 1;
 }
@@ -110,7 +114,8 @@ def OpenACC_ReductionCombineRegionOp
 //===----------------------------------------------------------------------===//
 
 def OpenACC_ReductionCombineOp: OpenACC_Op<"reduction_combine", 
-    [SameTypeOperands, DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
+    [AllElementTypesMatch<["destMemref", "srcMemref"]>,
+     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = "Combine a reduction partial sum with its original value";
   let description = [{
     This operation is a composite to do a typical update of a reduction
@@ -133,7 +138,15 @@ def OpenACC_ReductionCombineOp: OpenACC_Op<"reduction_combine",
     
     The `destMemref` operand is a "pointer" to the original reduction 
     variable (typically shared). The `srcMemref` operand is a "pointer"
-    to the partial sum of the reduction (typically private).
+    to the partial sum of the reduction (typically private). The two have
+    the same element type and shape; the destination may be a view with a
+    different layout, such as one element of an array, and the source type
+    is then printed after the destination type:
+
+    ```
+      acc.reduction_combine %src into %elt <max>
+          : memref<f32, strided<[], offset: ?>>, memref<f32>
+    ```
 
     The `kind` is the OpenACC reduction operator that determines how to 
     accumulate the two values.
@@ -147,7 +160,7 @@ def OpenACC_ReductionCombineOp: OpenACC_Op<"reduction_combine",
   let assemblyFormat = [{
     $srcMemref `into` $destMemref $reductionOperator
     (`par_dims` `(` qualified($par_dims)^ `)`)?
-    `:` type($destMemref) attr-dict
+    `:` custom<CombineTypes>(type($destMemref), type($srcMemref)) attr-dict
   }];
   let builders = [
     OpBuilder<(ins "::mlir::Value":$destMemref,
@@ -163,6 +176,7 @@ def OpenACC_ReductionCombineOp: OpenACC_Op<"reduction_combine",
             nullptr);
     }]>,
   ];
+  let hasVerifier = 1;
 }
 
 //===----------------------------------------------------------------------===//
