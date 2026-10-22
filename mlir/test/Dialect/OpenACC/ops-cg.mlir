@@ -326,6 +326,34 @@ func.func @parallel_reduction_pattern(%data: memref<8xi32>, %shared: memref<i32>
 
 // -----
 
+// The destination of a combine may be a view of one array element.
+// CHECK-LABEL: func @reduction_combine_into_element
+func.func @reduction_combine_into_element(%private: memref<f32>, %shared: memref<8xf32>, %k: index) {
+  %elt = memref.subview %shared[%k] [1] [1] : memref<8xf32> to memref<f32, strided<[], offset: ?>>
+  acc.reduction_combine %private into %elt <max> par_dims(#acc<par_dims[block_x]>) : memref<f32, strided<[], offset: ?>>, memref<f32>
+  return
+}
+// CHECK: acc.reduction_combine %{{.*}} into %{{.*}} <max> par_dims(#acc<par_dims[block_x]>) : memref<f32, strided<[], offset: ?>>, memref<f32>
+
+// -----
+
+// The destination of a combine region may also be a view of one element.
+// CHECK-LABEL: func @reduction_combine_region_into_element
+func.func @reduction_combine_region_into_element(%private: memref<complex<f32>>, %shared: memref<8xcomplex<f32>>, %k: index) {
+  %elt = memref.subview %shared[%k] [1] [1] : memref<8xcomplex<f32>> to memref<complex<f32>, strided<[], offset: ?>>
+  acc.reduction_combine_region %private into %elt : memref<complex<f32>>, memref<complex<f32>, strided<[], offset: ?>> {
+    %l = memref.load %elt[] : memref<complex<f32>, strided<[], offset: ?>>
+    %r = memref.load %private[] : memref<complex<f32>>
+    %s = complex.add %l, %r : complex<f32>
+    memref.store %s, %elt[] : memref<complex<f32>, strided<[], offset: ?>>
+    acc.yield
+  }
+  return
+}
+// CHECK: acc.reduction_combine_region %{{.*}} into %{{.*}} : memref<complex<f32>>, memref<complex<f32>, strided<[], offset: ?>> {
+
+// -----
+
 // CHECK-LABEL: func @reduction_accumulate_thread_x
 func.func @reduction_accumulate_thread_x(%partial: f32, %private: memref<f32>) {
   acc.reduction_accumulate %partial to %private <add>
