@@ -2158,6 +2158,16 @@ AliasAnalysis::getSourceImpl(mlir::Value v, bool getLastInstantiationPoint,
               !mlir::isa<fir::BaseBoxType>(ty))
             followBoxData = true;
         })
+        .Case([&](mlir::acc::PrivateLocalOp op) {
+          // Fresh private storage, keyed on its acc.privatize handle. Two
+          // materializations of one handle may select different slices, so
+          // they may alias but are never reported disjoint.
+          type = SourceKind::Allocate;
+          approximateSource = true;
+          v = walkBlockArgPassThroughs(op.getPrivatized());
+          defOp = nullptr;
+          breakFromLoop = true;
+        })
         .Case<ACC_DATA_ENTRY_AND_INIT_OPS>([&](auto op) {
           accSourceReturn = getSourceForACCMappedValue(
               v, op.getOperation(),

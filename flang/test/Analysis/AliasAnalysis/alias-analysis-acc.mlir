@@ -589,3 +589,46 @@ func.func @test_acc_compute_region_box_load(%arg0: !fir.ref<!fir.box<!fir.heap<!
   }
   return
 }
+
+// -----
+
+// acc.private_local materializes fresh private storage: it does not alias a
+// dummy argument captured by the same compute region.
+// CHECK-LABEL: Testing : "testPrivateLocalVsDummyNoAlias"
+// CHECK-DAG: priv#0 <-> dummy#0: NoAlias
+
+func.func @testPrivateLocalVsDummyNoAlias(%arg0: !fir.ref<!fir.array<8xf64>> {fir.bindc_name = "x"}) {
+  %c8 = arith.constant 8 : index
+  %0 = fir.dummy_scope : !fir.dscope
+  %s = fir.shape %c8 : (index) -> !fir.shape<1>
+  %dx = fir.declare %arg0(%s) dummy_scope %0 arg 1 uniq_name("_QFtestEx") : (!fir.ref<!fir.array<8xf64>>, !fir.shape<1>, !fir.dscope) -> !fir.ref<!fir.array<8xf64>>
+  %cx = acc.copyin varPtr(%dx : !fir.ref<!fir.array<8xf64>>) name("x") -> !fir.ref<!fir.array<8xf64>>
+  %h = acc.privatize : () -> !acc.private_type<memref<2xf64>>
+  acc.compute_region ins(%arg1 = %cx, %arg2 = %h) : (!fir.ref<!fir.array<8xf64>>, !acc.private_type<memref<2xf64>>) {
+    %p = acc.private_local %arg2 : (!acc.private_type<memref<2xf64>>) -> memref<2xf64>
+    %vp = fir.convert %p {test.ptr = "priv"} : (memref<2xf64>) -> !fir.ref<!fir.array<2xf64>>
+    %vx = fir.convert %arg1 {test.ptr = "dummy"} : (!fir.ref<!fir.array<8xf64>>) -> !fir.ref<!fir.array<8xf64>>
+    acc.yield
+  } <{origin = "acc.parallel"}>
+  return
+}
+
+// -----
+
+// Private storage of two different acc.privatize handles is disjoint, while
+// two materializations of one handle may be the same storage.
+// CHECK-LABEL: Testing : "testPrivateLocalHandles"
+// CHECK-DAG: priv_a#0 <-> priv_b#0: NoAlias
+// CHECK-DAG: priv_a#0 <-> priv_a2#0: MayAlias
+
+func.func @testPrivateLocalHandles() {
+  %ha = acc.privatize : () -> !acc.private_type<memref<2xf64>>
+  %hb = acc.privatize : () -> !acc.private_type<memref<2xf64>>
+  acc.compute_region ins(%arg0 = %ha, %arg1 = %hb) : (!acc.private_type<memref<2xf64>>, !acc.private_type<memref<2xf64>>) {
+    %a = acc.private_local %arg0 {test.ptr = "priv_a"} : (!acc.private_type<memref<2xf64>>) -> memref<2xf64>
+    %b = acc.private_local %arg1 {test.ptr = "priv_b"} : (!acc.private_type<memref<2xf64>>) -> memref<2xf64>
+    %a2 = acc.private_local %arg0 {test.ptr = "priv_a2"} : (!acc.private_type<memref<2xf64>>) -> memref<2xf64>
+    acc.yield
+  } <{origin = "acc.parallel"}>
+  return
+}
