@@ -205,3 +205,57 @@ module attributes {gpu.container_module} {
     return
   }
 }
+
+// -----
+
+// A combine without block dims outside any loop is applied by one block, but
+// with several blocks others may combine into the variable meanwhile, so it is
+// atomic; with one block it stays a plain update.
+
+// CHECK-LABEL: func.func @combine_in_multi_block_launch
+// CHECK:       gpu.launch
+// CHECK:         acc.atomic.update
+// CHECK-LABEL: func.func @combine_in_single_block_launch
+// CHECK:       gpu.launch
+// CHECK-NOT:     acc.atomic.update
+// CHECK:         gpu.terminator
+
+module attributes {gpu.container_module} {
+  gpu.module @cuda_device_mod {
+    gpu.func @multi_kernel() kernel {
+      gpu.return
+    }
+    gpu.func @single_kernel() kernel {
+      gpu.return
+    }
+  }
+
+  func.func @combine_in_multi_block_launch(%arg_res: memref<i32>) {
+    %bx = acc.par_width par_dim(#acc.par_dim<block_x>)
+    acc.compute_region launch(%kbx = %bx) ins(%a_res = %arg_res) : (memref<i32>) {
+      %c1_i32 = arith.constant 1 : i32
+      %acc = memref.alloca() : memref<i32>
+      memref.store %c1_i32, %acc[] : memref<i32>
+      acc.predicate_region {
+        acc.reduction_combine %acc into %a_res <add> par_dims(#acc<par_dims[thread_x]>) : memref<i32>
+      } {acc.active_par_dims = #acc<active_par_dims[]>}
+      acc.yield
+    } <{kernel_func_name = @multi_kernel, kernel_module_name = @cuda_device_mod, origin = "acc.parallel"}>
+    return
+  }
+
+  func.func @combine_in_single_block_launch(%arg_res: memref<i32>) {
+    %c1 = arith.constant 1 : index
+    %bx = acc.par_width %c1 par_dim(#acc.par_dim<block_x>)
+    acc.compute_region launch(%kbx = %bx) ins(%a_res = %arg_res) : (memref<i32>) {
+      %c1_i32 = arith.constant 1 : i32
+      %acc = memref.alloca() : memref<i32>
+      memref.store %c1_i32, %acc[] : memref<i32>
+      acc.predicate_region {
+        acc.reduction_combine %acc into %a_res <add> par_dims(#acc<par_dims[thread_x]>) : memref<i32>
+      } {acc.active_par_dims = #acc<active_par_dims[]>}
+      acc.yield
+    } <{kernel_func_name = @single_kernel, kernel_module_name = @cuda_device_mod, origin = "acc.parallel"}>
+    return
+  }
+}

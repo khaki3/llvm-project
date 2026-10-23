@@ -518,6 +518,11 @@ private:
   void constructAtomicAccumulation(Location loc, Value memref, Value input,
                                    arith::AtomicRMWKind kind);
 
+  /// Whether other blocks may combine into the destination of \p combineOp
+  /// while it is applied: it is outside any loop and the launch may run
+  /// several blocks.
+  bool mayCombineWithOtherBlocks(Operation *combineOp);
+
   /// Map an ACC reduction operator to an atomic RMW kind.
   FailureOr<arith::AtomicRMWKind> getReductionKind(acc::ReductionOperator redOp,
                                                    Type type, Location loc);
@@ -3902,6 +3907,20 @@ void ACCCGToGPULowering::processReductionOp(acc::ReductionInitOp op) {
   });
 }
 
+bool ACCCGToGPULowering::mayCombineWithOtherBlocks(Operation *combineOp) {
+  for (Operation *parent = combineOp->getParentOp();
+       parent && parent != computeRegion.getOperation();
+       parent = parent->getParentOp())
+    if (isa<LoopLikeOpInterface>(parent))
+      return false;
+  return llvm::any_of(computeRegion.getLaunchParDims(),
+                      [&](mlir::acc::GPUParallelDimAttr parDim) {
+                        return parDim.isAnyBlock() &&
+                               computeRegion.getKnownConstantLaunchArg(
+                                   parDim) != std::optional<uint64_t>(1);
+                      });
+}
+
 void ACCCGToGPULowering::processReductionCombineOp(acc::ReductionCombineOp op) {
   LLVM_DEBUG(llvm::dbgs() << "processing reduction combine op: ";
              op->print(llvm::dbgs()); llvm::dbgs() << "\n");
@@ -3929,10 +3948,14 @@ void ACCCGToGPULowering::processReductionCombineOp(acc::ReductionCombineOp op) {
   bool destIsPerThreadPrivate = isa_and_nonnull<memref::AllocaOp>(
       unwrapMemRefConversion(destMemref).getDefiningOp());
 
+  // Without block dims the combine is applied by one block, but other blocks
+  // may still combine into the same destination at the top of the launch.
+  bool mayCombineWithOthers = mayCombineWithOtherBlocks(op);
   SmallVector<mlir::acc::GPUParallelDimAttr> parDims =
       getReductionCombineParDims(op);
   for (auto parDim : parDims) {
-    if (parDim.isAnyBlock() && !destIsPerThreadPrivate) {
+    if ((parDim.isAnyBlock() || mayCombineWithOthers) &&
+        !destIsPerThreadPrivate) {
       // Block reduction directly stores to the accumulator using atomic.
       // The predication (tid.x == 0 when subgroup-aligned) is already handled
       // by the parent predicate_region processing.
@@ -3965,10 +3988,12 @@ void ACCCGToGPULowering::processCombineRegionOp(
   bool destIsPerThreadPrivate = isa_and_nonnull<memref::AllocaOp>(
       unwrapMemRefConversion(mapping.lookupOrDefault(op.getDestVar()))
           .getDefiningOp());
+  bool mayCombineWithOthers = mayCombineWithOtherBlocks(op);
   SmallVector<mlir::acc::GPUParallelDimAttr> parDims =
       getReductionCombineParDims(op);
   for (auto parDim : parDims) {
-    if (parDim.isAnyBlock() && !destIsPerThreadPrivate) {
+    if ((parDim.isAnyBlock() || mayCombineWithOthers) &&
+        !destIsPerThreadPrivate) {
       // Block reduction directly stores to the accumulator using atomic.
       // The predication (tid.x == 0 when subgroup-aligned) is already handled
       // by the parent predicate_region processing.
