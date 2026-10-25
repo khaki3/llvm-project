@@ -47,7 +47,9 @@
 //
 // 5. Reductions: `acc.reduction_*` ops are lowered to GPU reduction and
 //    synchronization primitives according to each reduction's parallel
-//    dimensions and accumulator storage class.
+//    dimensions and accumulator storage class. A combine across blocks
+//    outside any loop stores the partial of each block to a buffer, which a
+//    one-block launch after the kernel combines in a fixed order.
 //
 // Example:
 // --------
@@ -127,6 +129,7 @@
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/SaveAndRestore.h"
 #include <algorithm>
 #include <optional>
 #include <utility>
@@ -145,6 +148,9 @@ using namespace mlir;
 using namespace mlir::acc;
 
 enum class PrivateMemScope { Thread, Worker, Gang, None };
+
+/// Threads of the launch that combines the partials of each block.
+static constexpr int64_t kCombineLaunchWidth = 256;
 
 /// Device label used in compiler remarks (e.g. "NVIDIA GPU").
 static std::string getDeviceRemarkQualifier(DeviceType deviceType) {
@@ -519,6 +525,16 @@ private:
   void constructAtomicAccumulation(Location loc, Value memref, Value input,
                                    arith::AtomicRMWKind kind);
 
+  /// Combine \p input, the partial of this block, into \p dest across blocks.
+  void combineAcrossBlocks(Operation *combineOp, Value input, Value dest,
+                           arith::AtomicRMWKind kind);
+
+  /// Store \p input to the slot of this block, and combine the slots into
+  /// \p dest in a fixed order from a launch after this one. Fails without
+  /// changing the IR when that launch cannot run the combine.
+  LogicalResult combineAfterLaunch(Operation *combineOp, Value input,
+                                   Value dest, arith::AtomicRMWKind kind);
+
   /// Map an ACC reduction operator to an atomic RMW kind.
   FailureOr<arith::AtomicRMWKind> getReductionKind(acc::ReductionOperator redOp,
                                                    Type type, Location loc);
@@ -702,6 +718,12 @@ private:
   acc::OpenACCSupport &accSupport;
   const ACCCGToGPUOptions &options;
   gpu::LaunchOp launch;
+  // One-block launch after `launch` that combines the partials of its blocks.
+  gpu::LaunchOp combineLaunch;
+  // Number of blocks of `launch`, computed ahead of it.
+  Value numBlocks;
+  // Dims that the predicate regions being lowered run on index 0 only.
+  std::optional<SmallVector<mlir::acc::GPUParallelDimAttr>> predicatedParDims;
   IRMapping mapping;
   llvm::SmallVector<scf::ParallelOp> loopReductions;
   llvm::DenseMap<gpu::Processor, Value> threadIdMap;
@@ -2454,6 +2476,13 @@ void ACCCGToGPULowering::processPredicateRegion(
     }
   }
 
+  SmallVector<GPUParallelDimAttr> predicated = parDimsPair.second;
+  if (predicatedParDims)
+    for (GPUParallelDimAttr parDim : *predicatedParDims)
+      if (!llvm::is_contained(predicated, parDim))
+        predicated.push_back(parDim);
+  llvm::SaveAndRestore<std::optional<SmallVector<GPUParallelDimAttr>>>
+      predicatedGuard(predicatedParDims, predicated);
   if (Value predicate = emitPredicate(loc, parDimsPair.second)) {
     LLVM_DEBUG(llvm::dbgs() << "predicate: " << predicate << "\n");
     bool isInsideThreadXLoop = false;
@@ -3349,6 +3378,189 @@ void ACCCGToGPULowering::constructAtomicAccumulation(
   rewriter.setInsertionPointAfter(atomicUpdateOp);
 }
 
+/// Clones before \p launch the ops of it computing \p value, for use in another
+/// launch, and records them in \p cloned. Fails when the value depends on the
+/// thread running it, on memory, or on storage of the launch.
+static FailureOr<Value> cloneFromLaunch(Value value, gpu::LaunchOp launch,
+                                        IRMapping &cloneMapping,
+                                        SmallVectorImpl<Operation *> &cloned,
+                                        RewriterBase &rewriter) {
+  if (!launch->isAncestor(value.getParentRegion()->getParentOp()))
+    return value;
+  if (Value clone = cloneMapping.lookupOrNull(value))
+    return clone;
+  Operation *def = value.getDefiningOp();
+  if (!def || def->getNumRegions() != 0 ||
+      isa_and_nonnull<gpu::GPUDialect>(def->getDialect()))
+    return failure();
+  if (def->getNumOperands() == 0) {
+    if (!matchPattern(def, m_Constant()) &&
+        !isa<acc::AddressOfGlobalOpInterface, memref::GetGlobalOp>(def))
+      return failure();
+  } else if (!isMemoryEffectFree(def) &&
+             !isa<acc::OutlineIdentityOperandOpInterface>(def)) {
+    return failure();
+  }
+  // A declaration drops the operands that tie it to its scope.
+  Operation *clone = rewriter.clone(*def);
+  if (auto identityOp = dyn_cast<acc::OutlineIdentityOperandOpInterface>(clone))
+    rewriter.modifyOpInPlace(
+        clone, [&] { identityOp.dropOutlinedIdentityOperands(); });
+  for (OpOperand &operand : clone->getOpOperands()) {
+    FailureOr<Value> operandClone =
+        cloneFromLaunch(operand.get(), launch, cloneMapping, cloned, rewriter);
+    if (failed(operandClone)) {
+      rewriter.eraseOp(clone);
+      return failure();
+    }
+    rewriter.modifyOpInPlace(clone, [&] { operand.set(*operandClone); });
+  }
+  rewriter.moveOpBefore(clone, launch);
+  cloneMapping.map(def->getResults(), clone->getResults());
+  cloned.push_back(clone);
+  return clone->getResult(cast<OpResult>(value).getResultNumber());
+}
+
+void ACCCGToGPULowering::combineAcrossBlocks(Operation *combineOp, Value input,
+                                             Value dest,
+                                             arith::AtomicRMWKind kind) {
+  if (failed(combineAfterLaunch(combineOp, input, dest, kind)))
+    constructAtomicAccumulation(combineOp->getLoc(), dest, input, kind);
+}
+
+LogicalResult
+ACCCGToGPULowering::combineAfterLaunch(Operation *combineOp, Value input,
+                                       Value dest, arith::AtomicRMWKind kind) {
+  // A single block combines into the destination directly.
+  if (!launch || !launch.getAsyncDependencies().empty() ||
+      llvm::all_of(ValueRange{launch.getGridSizeX(), launch.getGridSizeY(),
+                              launch.getGridSizeZ()},
+                   [](Value size) { return isConstantIntValue(size, 1); }))
+    return failure();
+  // Every block runs the combine once, outside any loop, on one thread: no
+  // block dim is predicated, every thread dim is.
+  if (!predicatedParDims ||
+      llvm::any_of(computeRegion.getLaunchParDims(),
+                   [&](GPUParallelDimAttr parDim) {
+                     return parDim.isAnyBlock() ==
+                            llvm::is_contained(*predicatedParDims, parDim);
+                   }))
+    return failure();
+  for (Operation *parent = combineOp->getParentOp(); parent != computeRegion;
+       parent = parent->getParentOp())
+    if (!isa<acc::PredicateRegionOp>(parent))
+      return failure();
+  auto destType = dyn_cast<MemRefType>(dest.getType());
+  if (!destType || destType.getRank() != 0)
+    return failure();
+
+  Location loc = combineOp->getLoc();
+  Value partials;
+  {
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPoint(launch);
+    IRMapping cloneMapping;
+    SmallVector<Operation *> cloned;
+    FailureOr<Value> finalDest =
+        cloneFromLaunch(dest, launch, cloneMapping, cloned, rewriter);
+    if (failed(finalDest)) {
+      for (Operation *op : llvm::reverse(cloned))
+        rewriter.eraseOp(op);
+      return failure();
+    }
+
+    if (!numBlocks) {
+      numBlocks = arith::MulIOp::create(
+          rewriter, loc,
+          arith::MulIOp::create(rewriter, loc, launch.getGridSizeX(),
+                                launch.getGridSizeY()),
+          launch.getGridSizeZ());
+    }
+    partials =
+        gpu::AllocOp::create(
+            rewriter, loc,
+            MemRefType::get({ShapedType::kDynamic}, destType.getElementType()),
+            /*asyncToken=*/Type(), /*asyncDependencies=*/ValueRange(),
+            /*dynamicSizes=*/numBlocks,
+            /*symbolOperands=*/ValueRange(), /*hostShared=*/false)
+            .getMemref();
+    if (!combineLaunch) {
+      rewriter.setInsertionPointAfter(launch);
+      Value one = arith::ConstantIndexOp::create(rewriter, loc, 1);
+      Value width =
+          arith::ConstantIndexOp::create(rewriter, loc, kCombineLaunchWidth);
+      combineLaunch =
+          gpu::LaunchOp::create(rewriter, loc, one, one, one, width, one, one);
+      if (FlatSymbolRefAttr module = launch.getModuleAttr())
+        combineLaunch.setModuleAttr(module);
+      rewriter.setInsertionPointToEnd(&combineLaunch.getBody().front());
+      gpu::TerminatorOp::create(rewriter, loc);
+    }
+    rewriter.setInsertionPointAfter(combineLaunch);
+    gpu::DeallocOp::create(rewriter, loc, /*asyncToken=*/Type(),
+                           /*asyncDependencies=*/ValueRange(), partials);
+
+    // Thread t folds the partials t, t + width, ... into slot t, and thread 0
+    // then folds the slots into the destination, both in a fixed order.
+    Operation *terminator = combineLaunch.getBody().front().getTerminator();
+    for (Operation *op : cloned)
+      rewriter.moveOpBefore(op, terminator);
+    rewriter.setInsertionPoint(terminator);
+    auto fold = [&](Value first, Value lb, Value ub, Value step) {
+      return scf::ForOp::create(
+                 rewriter, loc, lb, ub, step, first,
+                 [&](OpBuilder &b, Location bodyLoc, Value iv, ValueRange acc) {
+                   Value partial =
+                       memref::LoadOp::create(b, bodyLoc, partials, iv);
+                   scf::YieldOp::create(
+                       b, bodyLoc,
+                       generateReductionOp(b, bodyLoc, acc[0], partial, kind));
+                 })
+          .getResult(0);
+    };
+    Value tid = combineLaunch.getThreadIds().x;
+    Value width = combineLaunch.getBlockSize().x;
+    Value zero = arith::ConstantIndexOp::create(rewriter, loc, 0);
+    Value one = arith::ConstantIndexOp::create(rewriter, loc, 1);
+    Value hasPartial = arith::CmpIOp::create(
+        rewriter, loc, arith::CmpIPredicate::ult, tid, numBlocks);
+    auto threadFold = scf::IfOp::create(rewriter, loc, hasPartial);
+    rewriter.setInsertionPoint(threadFold.thenBlock()->getTerminator());
+    Value next = arith::AddIOp::create(rewriter, loc, tid, width);
+    Value threadTotal =
+        fold(memref::LoadOp::create(rewriter, loc, partials, tid), next,
+             numBlocks, width);
+    memref::StoreOp::create(rewriter, loc, threadTotal, partials, tid);
+    rewriter.setInsertionPointAfter(threadFold);
+    gpu::BarrierOp::create(rewriter, loc);
+    Value isFirstThread = arith::AndIOp::create(
+        rewriter, loc, hasPartial,
+        arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::eq, tid,
+                              zero));
+    auto finalFold = scf::IfOp::create(rewriter, loc, isFirstThread);
+    rewriter.setInsertionPoint(finalFold.thenBlock()->getTerminator());
+    Value slots = arith::MinUIOp::create(rewriter, loc, numBlocks, width);
+    Value total = fold(memref::LoadOp::create(rewriter, loc, partials, zero),
+                       one, slots, one);
+    Value old = memref::LoadOp::create(rewriter, loc, *finalDest, ValueRange{});
+    memref::StoreOp::create(
+        rewriter, loc, generateReductionOp(rewriter, loc, total, old, kind),
+        *finalDest, ValueRange{});
+  }
+
+  // The slot of this block is its linear index in the grid.
+  Value blockId = getGPUThreadIdFor(gpu::Processor::BlockZ);
+  for (gpu::Processor processor :
+       {gpu::Processor::BlockY, gpu::Processor::BlockX}) {
+    blockId =
+        arith::MulIOp::create(rewriter, loc, blockId, getGPUSizeFor(processor));
+    blockId = arith::AddIOp::create(rewriter, loc, blockId,
+                                    getGPUThreadIdFor(processor));
+  }
+  memref::StoreOp::create(rewriter, loc, input, partials, blockId);
+  return success();
+}
+
 void ACCCGToGPULowering::createGPUAllReduceOp(
     Location loc, Value input, Value memref, arith::AtomicRMWKind kind,
     mlir::acc::GPUParallelDimsAttr parDimsAttr, ValueRange indices,
@@ -3968,7 +4180,6 @@ void ACCCGToGPULowering::processReductionCombineOp(acc::ReductionCombineOp op) {
       getReductionCombineParDims(op);
   for (auto parDim : parDims) {
     if (parDim.isAnyBlock() && !destIsPerThreadPrivate) {
-      // Block reduction directly stores to the accumulator using atomic.
       // The predication (tid.x == 0 when subgroup-aligned) is already handled
       // by the parent predicate_region processing.
       // Reloading a grid-shared slot races with other blocks; record
@@ -3976,7 +4187,7 @@ void ACCCGToGPULowering::processReductionCombineOp(acc::ReductionCombineOp op) {
       auto srcLoad =
           memref::LoadOp::create(rewriter, loc, srcMemref, ValueRange{});
       pendingCombineReloads.push_back({srcMemref, srcLoad});
-      constructAtomicAccumulation(loc, destMemref, srcLoad, kind);
+      combineAcrossBlocks(op, srcLoad, destMemref, kind);
       return;
     }
   }
@@ -4004,7 +4215,6 @@ void ACCCGToGPULowering::processCombineRegionOp(
       getReductionCombineParDims(op);
   for (auto parDim : parDims) {
     if (parDim.isAnyBlock() && !destIsPerThreadPrivate) {
-      // Block reduction directly stores to the accumulator using atomic.
       // The predication (tid.x == 0 when subgroup-aligned) is already handled
       // by the parent predicate_region processing.
       for (Operation *user : op.getSrcVar().getUsers()) {
@@ -4021,9 +4231,8 @@ void ACCCGToGPULowering::processCombineRegionOp(
           auto reductionLoad =
               memref::LoadOp::create(rewriter, loc, srcMemref, ValueRange{});
           pendingCombineReloads.push_back({srcMemref, reductionLoad});
-          constructAtomicAccumulation(loc,
-                                      mapping.lookupOrDefault(op.getDestVar()),
-                                      reductionLoad, *kind);
+          combineAcrossBlocks(op, reductionLoad,
+                              mapping.lookupOrDefault(op.getDestVar()), *kind);
           return;
         }
       }
@@ -4041,9 +4250,8 @@ void ACCCGToGPULowering::processCombineRegionOp(
           if (isa<complex::MulOp>(innerOp))
             kind = arith::AtomicRMWKind::mulf;
         });
-        constructAtomicAccumulation(loc,
-                                    mapping.lookupOrDefault(op.getDestVar()),
-                                    reductionResult, kind);
+        combineAcrossBlocks(op, reductionResult,
+                            mapping.lookupOrDefault(op.getDestVar()), kind);
         return;
       }
     }
